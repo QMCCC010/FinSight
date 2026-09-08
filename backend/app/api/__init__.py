@@ -1,0 +1,2 @@
+"""FastAPI public application."""
+

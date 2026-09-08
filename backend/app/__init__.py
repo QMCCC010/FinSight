@@ -1,0 +1,2 @@
+"""Financial research assistant application."""
+

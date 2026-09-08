@@ -1,0 +1,171 @@
+<script setup lang="ts">
+import { nextTick, onMounted, onUnmounted, ref } from 'vue'
+import { ElMessage } from 'element-plus'
+import DOMPurify from 'dompurify'
+import { marked } from 'marked'
+import { api } from '../api'
+
+const sessions = ref<any[]>([])
+const activeSession = ref<number | null>(null)
+const messages = ref<any[]>([])
+const question = ref('')
+const sending = ref(false)
+const controlling = ref<number | null>(null)
+let timer: number | undefined
+let streamAbort: AbortController | undefined
+const terminalStatuses = ['COMPLETED', 'PARTIAL', 'FAILED', 'CANCELLED', 'NEEDS_CLARIFICATION']
+
+async function loadSessions() {
+  sessions.value = (await api.get('/chat/sessions')).data
+  if (!activeSession.value && sessions.value.length) await openSession(sessions.value[0].id)
+}
+async function newSession() {
+  const { data } = await api.post('/chat/sessions', { title: '新对话' })
+  sessions.value.unshift(data); activeSession.value = data.id; messages.value = []
+  startMessageStream(data.id)
+}
+async function openSession(id: number) {
+  activeSession.value = id
+  messages.value = (await api.get(`/chat/sessions/${id}/messages`)).data
+  startMessageStream(id)
+}
+async function refreshMessages() {
+  if (activeSession.value) messages.value = (await api.get(`/chat/sessions/${activeSession.value}/messages`)).data
+}
+async function startMessageStream(id: number) {
+  streamAbort?.abort()
+  const controller = new AbortController()
+  streamAbort = controller
+  const baseURL = String(api.defaults.baseURL || '').replace(/\/$/, '')
+  try {
+    const response = await fetch(`${baseURL}/chat/sessions/${id}/events`, {
+      headers: { Authorization: `Bearer ${localStorage.getItem('access_token') || ''}` },
+      signal: controller.signal,
+    })
+    if (!response.ok || !response.body) throw new Error('SSE unavailable')
+    const reader = response.body.getReader()
+    const decoder = new TextDecoder()
+    let buffer = ''
+    while (!controller.signal.aborted) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      const blocks = buffer.split('\n\n')
+      buffer = blocks.pop() || ''
+      for (const block of blocks) {
+        const dataLine = block.split('\n').find(line => line.startsWith('data: '))
+        if (dataLine && activeSession.value === id) messages.value = JSON.parse(dataLine.slice(6))
+      }
+    }
+  } catch (error: any) {
+    if (error?.name !== 'AbortError') await refreshMessages()
+  }
+}
+async function send() {
+  if (!question.value.trim()) return
+  if (!activeSession.value) await newSession()
+  sending.value = true
+  try {
+    const { data } = await api.post(`/chat/sessions/${activeSession.value}/messages`, { question: question.value })
+    messages.value.push(data); question.value = ''; await nextTick()
+  } finally { sending.value = false }
+}
+function replaceMessage(data: any) {
+  const index = messages.value.findIndex(item => item.id === data.id)
+  if (index >= 0) messages.value[index] = data
+}
+function waitingSeconds(message: any) {
+  return Math.max(0, Math.floor((Date.now() - new Date(message.updated_at || message.created_at).getTime()) / 1000))
+}
+async function cancelMessage(message: any) {
+  controlling.value = message.id
+  try {
+    const { data } = await api.post(`/chat/messages/${message.id}/cancel`)
+    replaceMessage(data)
+    ElMessage.success('任务已停止')
+  } catch (error: any) {
+    ElMessage.error(error.response?.data?.detail || '停止失败，正在刷新状态')
+    await refreshMessages()
+  } finally { controlling.value = null }
+}
+async function retryMessage(message: any) {
+  controlling.value = message.id
+  try {
+    const { data } = await api.post(`/chat/messages/${message.id}/retry`)
+    replaceMessage(data)
+    ElMessage.success('已重新提交到问答队列')
+  } catch (error: any) {
+    ElMessage.error(error.response?.data?.detail || '重新执行失败')
+  } finally { controlling.value = null }
+}
+async function resolveCompany(message: any, stockCode: string) {
+  controlling.value = message.id
+  try {
+    const { data } = await api.post(`/chat/messages/${message.id}/resolve-company`, { stock_code: stockCode })
+    replaceMessage(data)
+  } finally { controlling.value = null }
+}
+function externalSource(url?: string) { return Boolean(url && /^https?:\/\//i.test(url)) }
+function formatDate(value?: string) { return value ? value.slice(0, 16).replace('T', ' ') : '暂无可靠时间' }
+function refreshTone(status?: string) {
+  if (status === 'FAILED') return 'refresh-failed'
+  if (status === 'PARTIAL') return 'refresh-partial'
+  if (status === 'COMPLETED') return 'refresh-completed'
+  return 'refresh-active'
+}
+function statusLabel(status?: string) {
+  return ({ QUEUED: '排队中', RESOLVING_ENTITY: '识别标的', COLLECTING: '首次采集', PROCESSING: '检索分析', ANSWERING: '生成回答', COMPLETED: '已完成', PARTIAL: '部分完成', FAILED: '失败', CANCELLED: '已停止' } as Record<string, string>)[status || ''] || status || '-'
+}
+function sourceLabel(source?: string) {
+  return ({ RESEARCH_REPORT: '券商研报', NEWS: '财经新闻', ANNOUNCEMENT: '公司公告', SOCIAL: '公开舆情', MARKET_DATA: '行情数据' } as Record<string, string>)[source || ''] || source || '资料'
+}
+function resolvedSubject(message: any) { return message.analysis_metadata?.resolved_subject }
+function renderMarkdown(content?: string) {
+  if (!content) return ''
+  return DOMPurify.sanitize(marked.parse(content, { async: false }) as string, { USE_PROFILES: { html: true } })
+}
+function progressSteps(message: any) {
+  const steps = [
+    { label: '识别问题与公司', threshold: 10 },
+    { label: '检查知识库', threshold: 20 },
+    { label: '检索并调用工具', threshold: 55 },
+    { label: '生成与校验回答', threshold: 80 },
+  ]
+  return steps.map((step, index) => ({ ...step, state: message.progress > step.threshold || terminalStatuses.includes(message.status) ? 'done' : message.progress >= step.threshold || (index === 0 && message.progress < 10) ? 'active' : 'pending' }))
+}
+function validationLabel(message: any) {
+  const validation = message.analysis_metadata?.validation
+  if (!validation) return '未记录校验'
+  if (validation.mode === 'STRUCTURED_COMPARISON') return '结构化机构对比'
+  if (validation.mode === 'EVIDENCE_FALLBACK') return '证据原文模式'
+  if (validation.mode === 'FILTERED_LLM') return '已过滤无证据段落'
+  if (validation.mode === 'LLM_REPAIRED') return '自动修订后通过校验'
+  return validation.valid ? '引用与数字校验通过' : '已降级为安全回答'
+}
+onMounted(async () => { await loadSessions(); if (!activeSession.value) await newSession(); timer = window.setInterval(refreshMessages, 10000) })
+onUnmounted(() => { if (timer) window.clearInterval(timer); streamAbort?.abort() })
+</script>
+
+<template>
+  <div class="chat-layout">
+    <aside class="chat-sessions"><button class="primary-button" @click="newSession">＋ 新建研究对话</button><button v-for="item in sessions" :key="item.id" :class="{ active: activeSession === item.id }" @click="openSession(item.id)"><strong>{{ item.title }}</strong><small>{{ item.updated_at?.slice(0, 16).replace('T', ' ') }}</small></button></aside>
+    <section class="chat-main">
+      <div class="chat-header"><div><span class="eyebrow">LANGGRAPH AGENT</span><h1>智能研究问答</h1></div><span class="pill">自动检索 · 自动续答</span></div>
+      <div class="message-list">
+        <div v-if="!messages.length" class="chat-welcome"><span class="brand-mark large">F</span><h2>从公司或行业问题开始</h2><p>系统会自动判断问题类型；公司资料不足时自动采集，行业问题会跨公司检索现有知识库。</p><div class="suggestions"><button @click="question='宁德时代最近的机构观点有什么分歧？'">宁德时代的机构分歧</button><button @click="question='新能源汽车行业最近有哪些重要事件？'">新能源汽车行业</button><button @click="question='这个系统能做什么？'">查看系统能力</button></div></div>
+        <article v-for="message in messages" :key="message.id" class="message-block">
+          <div class="user-question"><span>你</span><p>{{ message.question }}</p></div>
+          <div class="agent-answer">
+            <span class="brand-mark small">F</span>
+            <div v-if="!terminalStatuses.includes(message.status)" class="progress-answer"><div v-if="resolvedSubject(message)" class="entity-confirmation"><strong>已确认：{{ resolvedSubject(message).name }}</strong><span v-if="resolvedSubject(message).stock_code">{{ resolvedSubject(message).stock_code }} · {{ resolvedSubject(message).exchange_label }} · {{ resolvedSubject(message).listing_status }}</span><span v-else>{{ resolvedSubject(message).name }}</span></div><strong>{{ message.status_text }}</strong><div class="process-steps"><span v-for="step in progressSteps(message)" :key="step.label" :class="`step-${step.state}`"><i></i>{{ step.label }}</span></div><el-progress :percentage="message.progress" :stroke-width="8" /><div class="task-controls"><small>{{ statusLabel(message.status) }} · 已等待 {{ waitingSeconds(message) }} 秒 · 状态会自动更新</small><button class="stop-button" :disabled="controlling === message.id" @click="cancelMessage(message)">停止任务</button></div><p v-if="waitingSeconds(message) >= 30" class="queue-warning">等待时间较长，可停止后重新执行；问答队列不会再被采集任务阻塞。</p></div>
+            <div v-else-if="message.status === 'FAILED'" class="error-box"><p>{{ message.error || message.status_text }}</p><button class="retry-button" :disabled="controlling === message.id" @click="retryMessage(message)">重新执行</button></div>
+            <div v-else-if="message.status === 'CANCELLED'" class="cancelled-box"><p>{{ message.status_text }}</p><button class="retry-button" :disabled="controlling === message.id" @click="retryMessage(message)">重新执行</button></div>
+            <div v-else-if="message.status === 'NEEDS_CLARIFICATION'" class="clarification-box"><strong>{{ message.status_text }}</strong><p>请选择准确标的，系统不会在公司不明确时猜测。</p><div class="candidate-buttons"><button v-for="candidate in message.clarification_candidates || []" :key="candidate.stock_code" :disabled="controlling === message.id" @click="resolveCompany(message, candidate.stock_code)">{{ candidate.name }}（{{ candidate.stock_code }} · {{ candidate.exchange_label || candidate.exchange }}）</button></div></div>
+            <div v-else class="answer-content"><div v-if="resolvedSubject(message)" class="entity-confirmation compact"><strong>{{ resolvedSubject(message).name }}<template v-if="resolvedSubject(message).stock_code">（{{ resolvedSubject(message).stock_code }}）</template></strong><span>{{ resolvedSubject(message).exchange_label }} · {{ resolvedSubject(message).listing_status }}</span></div><div class="answer-meta"><span :class="`status-${message.status.toLowerCase()}`">{{ statusLabel(message.status) }}</span><span>{{ message.analysis_metadata?.research_intent_label || '综合研究' }}</span><span>可信度 {{ message.confidence || '-' }}</span><span>资料截至 {{ formatDate(message.data_as_of) }}</span><span>{{ validationLabel(message) }}</span></div><div v-if="message.refresh_status" class="refresh-notice" :class="refreshTone(message.refresh_status)"><strong>后台资料更新 · {{ statusLabel(message.refresh_status) }}</strong><span>{{ message.refresh_status_text }}</span><small v-if="['QUEUED', 'RUNNING'].includes(message.refresh_status)">当前回答已经完成，无需等待；更新完成后会自动进入共享知识库，供后续问题使用。</small></div><div v-if="message.analysis_metadata?.retrieval_scope?.intent_fallback_used" class="partial-warning">首选资料类型不足，本次已回退检索该公司的其他资料，结论可能不够完整。</div><div v-if="message.missing_sources?.length" class="partial-warning">本次回答缺少部分来源：{{ message.missing_sources.map(sourceLabel).join('、') }}</div><div class="markdown-text" v-html="renderMarkdown(message.answer)"></div><details v-if="message.citations?.length"><summary>查看 {{ message.citations.length }} 条证据来源</summary><component :is="externalSource(citation.source_url) ? 'a' : 'div'" v-for="(citation, index) in message.citations" :key="index" :href="externalSource(citation.source_url) ? citation.source_url : undefined" target="_blank" rel="noopener" class="citation"><strong>[{{ index + 1 }}] {{ citation.title }}</strong><p>{{ citation.quote }}</p><small>{{ sourceLabel(citation.source_type) }} · {{ citation.page ? `第${citation.page}页` : citation.source_type === 'MARKET_DATA' ? '结构化行情' : '网页正文' }} · {{ externalSource(citation.source_url) ? '打开原文 ↗' : citation.source_name || '本地演示快照' }}</small></component></details></div>
+          </div>
+        </article>
+      </div>
+      <form class="chat-composer" @submit.prevent="send"><textarea v-model="question" placeholder="输入公司、行业、研报、财务或风险问题…" @keydown.ctrl.enter="send"></textarea><button class="primary-button inline" :disabled="sending">发送</button><small>Ctrl + Enter 发送 · 重要结论将附原文来源</small></form>
+    </section>
+  </div>
+</template>

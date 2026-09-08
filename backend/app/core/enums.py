@@ -1,0 +1,65 @@
+from enum import StrEnum
+
+
+class UserRole(StrEnum):
+    ADMIN = "ADMIN"
+    ANALYST = "ANALYST"
+
+
+class TrackingMode(StrEnum):
+    SEED = "SEED"
+    PINNED = "PINNED"
+    ON_DEMAND = "ON_DEMAND"
+    INACTIVE = "INACTIVE"
+
+
+class DocumentType(StrEnum):
+    RESEARCH_REPORT = "RESEARCH_REPORT"
+    NEWS = "NEWS"
+    ANNOUNCEMENT = "ANNOUNCEMENT"
+    SOCIAL = "SOCIAL"
+
+
+class DocumentStatus(StrEnum):
+    DISCOVERED = "DISCOVERED"
+    DOWNLOADED = "DOWNLOADED"
+    PARSED = "PARSED"
+    EXTRACTED = "EXTRACTED"
+    INDEXED = "INDEXED"
+    FAILED = "FAILED"
+
+
+class RunStatus(StrEnum):
+    QUEUED = "QUEUED"
+    RUNNING = "RUNNING"
+    COMPLETED = "COMPLETED"
+    PARTIAL = "PARTIAL"
+    FAILED = "FAILED"
+
+
+class TriggerType(StrEnum):
+    SCHEDULED = "SCHEDULED"
+    ADMIN = "ADMIN"
+    ON_DEMAND = "ON_DEMAND"
+    RETRY = "RETRY"
+
+
+class MessageStatus(StrEnum):
+    QUEUED = "QUEUED"
+    RESOLVING_ENTITY = "RESOLVING_ENTITY"
+    COLLECTING = "COLLECTING"
+    PROCESSING = "PROCESSING"
+    ANSWERING = "ANSWERING"
+    NEEDS_CLARIFICATION = "NEEDS_CLARIFICATION"
+    COMPLETED = "COMPLETED"
+    PARTIAL = "PARTIAL"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+
+
+class Sentiment(StrEnum):
+    POSITIVE = "POSITIVE"
+    SLIGHTLY_POSITIVE = "SLIGHTLY_POSITIVE"
+    NEUTRAL = "NEUTRAL"
+    SLIGHTLY_NEGATIVE = "SLIGHTLY_NEGATIVE"
+    NEGATIVE = "NEGATIVE"
