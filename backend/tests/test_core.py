@@ -3,6 +3,7 @@ from io import BytesIO
 from types import SimpleNamespace
 import zipfile
 
+import pymupdf as fitz
 import pytest
 from billiard.exceptions import SoftTimeLimitExceeded
 
@@ -15,9 +16,10 @@ from app.ai.grounding import classify_research_intent, filter_unsupported_lines,
 from app.ai.milvus_store import _filter_expression
 from app.ai.reporting import _clusters, _metric_label, _safe_llm_summary
 from app.collector.demo_data import demo_items
+from app.collector.adapters.announcement import cninfo_pdf_url
 from app.core.security import hash_password, verify_password
 from app.core.schemas import ReportComparisonRequest
-from app.services.parser import chunk_pages
+from app.services.parser import assess_text_quality, chunk_pages, normalize_text, parse_pdf
 from app.services.report_export import export_docx, export_pdf
 from app.services.crawl_runs import normalize_source_types, run_covers, run_source_types
 
@@ -88,6 +90,67 @@ def test_chunking_preserves_page_number_and_overlap():
     assert len(chunks) > 2
     assert all(page == 3 for page, _ in chunks)
     assert all(len(text) <= 100 for _, text in chunks)
+
+
+def test_cninfo_detail_url_resolves_to_canonical_pdf():
+    detail = (
+        "http://www.cninfo.com.cn/new/disclosure/detail?"
+        "stockCode=688836&announcementId=1225544788&"
+        "announcementTime=2026-09-03"
+    )
+    assert cninfo_pdf_url(detail) == (
+        "https://static.cninfo.com.cn/finalpage/2026-09-03/1225544788.PDF"
+    )
+
+
+def test_template_shell_is_not_usable_document_text():
+    template = """巨潮资讯网
+{{month}}
+{{stockName}}
+{{isDownloading? '下载中' : '公告下载'}}"""
+    quality = assess_text_quality(template)
+    assert not quality.usable
+    assert any("模板占位符" in warning for warning in quality.warnings)
+    assert normalize_text(template) == ""
+
+
+def test_soft_pdf_line_wraps_are_rejoined_without_flattening_lists():
+    text = normalize_text("公司主营业务持续增\n长，盈利能力保持稳定。\n1、第一项\n2、第二项")
+    assert "持续增长，盈利能力" in text
+    assert "\n1、第一项\n2、第二项" in text
+
+
+def test_pdf_parser_removes_repeated_margins_and_keeps_pages():
+    document = fitz.open()
+    for index in range(2):
+        page = document.new_page()
+        page.insert_text((72, 40), "REPEATED COMPANY HEADER")
+        page.insert_text((72, 100), f"Substantive announcement paragraph {index + 1} " * 8)
+        page.insert_text((280, 800), str(index + 1))
+    text, pages = parse_pdf(document.tobytes())
+    document.close()
+    assert len(pages) == 2
+    assert "Substantive announcement paragraph 1" in text
+    assert "Substantive announcement paragraph 2" in text
+    assert "REPEATED COMPANY HEADER" not in text
+
+
+def test_fallback_summary_is_labeled_as_preview_and_skips_furniture():
+    document = SimpleNamespace(
+        document_type="ANNOUNCEMENT",
+        title="利润分配公告",
+        source_name="巨潮资讯",
+        parsed_text=(
+            "证券代码：000001\n"
+            "本公司及董事会全体成员保证公告内容真实、准确、完整。\n"
+            "公司拟以现有总股本为基数，每十股派发现金红利三元。"
+        ),
+        raw_text=None,
+    )
+    result = rule_based_extract(document)
+    assert result.summary_method == "PREVIEW"
+    assert "每十股派发现金红利三元" in result.summary
+    assert "证券代码" not in result.summary
 
 
 def test_milvus_filter_is_applied_before_hybrid_search():

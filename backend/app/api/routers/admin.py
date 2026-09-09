@@ -2,7 +2,7 @@ from uuid import uuid4
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.api.dependencies import require_admin
@@ -122,12 +122,25 @@ def reprocess_document(document_id: int, db: Session = Depends(get_db), _: User 
 def reprocess_documents_batch(
     failed_only: bool = False,
     limit: int = 100,
+    document_type: str | None = None,
+    source_name: str | None = None,
+    legacy_only: bool = False,
     db: Session = Depends(get_db),
     _: User = Depends(require_admin),
 ) -> dict:
-    query = select(Document).where(Document.is_deleted.is_(False)).order_by(Document.id.desc()).limit(min(max(limit, 1), 500))
+    query = select(Document).where(Document.is_deleted.is_(False))
     if failed_only:
         query = query.where(Document.status == DocumentStatus.FAILED)
+    if document_type:
+        query = query.where(Document.document_type == document_type)
+    if source_name:
+        query = query.where(Document.source_name == source_name)
+    if legacy_only:
+        query = query.where(or_(
+            Document.raw_path.like("%.html"),
+            Document.parsed_text.like("%{{%"),
+        ))
+    query = query.order_by(Document.id.desc()).limit(min(max(limit, 1), 500))
     documents = list(db.scalars(query).all())
     from app.worker.tasks import process_document
     job_ids = []

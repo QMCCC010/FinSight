@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 import logging
+from pathlib import Path
 from time import perf_counter
 from uuid import uuid4
 
@@ -18,7 +19,7 @@ from app.core.config import get_settings
 from app.core.database import SessionLocal
 from app.core.enums import DocumentStatus, MessageStatus, RunStatus, TrackingMode, TriggerType
 from app.core.models import ChatMessage, Company, CrawlRun, DataSource, Document, DocumentChunk, GeneratedReport, MarketPrice, ReportVersion
-from app.services.parser import chunk_pages, parse_stored
+from app.services.parser import PARSER_VERSION, assess_text_quality, chunk_pages, parse_stored
 from app.services.storage import content_hash, save_raw
 from app.services.crawl_runs import normalize_source_types, run_covers, run_source_types
 
@@ -27,12 +28,87 @@ logger = logging.getLogger(__name__)
 LIMITS = {"RESEARCH_REPORT": 10, "NEWS": 20, "ANNOUNCEMENT": 10, "SOCIAL": 30}
 
 
-def _process_document(db, document: Document) -> None:
+def _ensure_cninfo_pdf(db, document: Document) -> int | None:
+    """Replace a legacy CNInfo detail-page template with the canonical PDF.
+
+    Return the id of an already-ingested canonical document when the legacy
+    record is a duplicate. The caller can then retire the bad shell record
+    without retrying a permanent content-hash conflict.
+    """
+    if document.document_type != "ANNOUNCEMENT" or "巨潮" not in document.source_name:
+        return None
+    path = Path(document.raw_path) if document.raw_path else None
+    if path and path.exists():
+        with path.open("rb") as stream:
+            if stream.read(5) == b"%PDF":
+                return None
+    from app.collector.adapters.announcement import download_cninfo_pdf
+
+    content, pdf_url = download_cninfo_pdf(document.source_url, document.published_at)
+    company = db.get(Company, document.company_id)
+    stock_code = company.stock_code if company else str(document.company_id)
+    canonical_hash = content_hash(f"{stock_code}|{pdf_url}|{content_hash(content)}")
+    duplicate_id = db.scalar(
+        select(Document.id).where(
+            Document.content_hash == canonical_hash,
+            Document.id != document.id,
+        )
+    )
+    if duplicate_id:
+        return duplicate_id
+    document.raw_path = save_raw(
+        stock_code,
+        document.document_type,
+        document.title,
+        content,
+        "pdf",
+    )
+    document.raw_text = None
+    document.source_url = pdf_url
+    document.content_hash = canonical_hash
+    return None
+
+
+def _process_document(db, document: Document) -> str:
+    # A transient vector-store outage must not repeat PDF parsing and the LLM
+    # extraction. Celery retries can resume directly from the committed chunks.
+    if document.status == DocumentStatus.EXTRACTED:
+        existing_chunks = db.scalar(
+            select(func.count(DocumentChunk.id)).where(
+                DocumentChunk.document_id == document.id
+            )
+        ) or 0
+        if existing_chunks:
+            index_document(db, document.id)
+            document.status = DocumentStatus.INDEXED
+            document.error_stage = None
+            document.error_message = None
+            db.commit()
+            return "indexed"
     try:
+        duplicate_id = _ensure_cninfo_pdf(db, document)
+        if duplicate_id:
+            # Remove vectors created from the old JavaScript template page,
+            # then hide the shell record. The canonical PDF remains as the
+            # single user-visible and searchable document.
+            remove_document_from_index(document.id)
+            document.is_deleted = True
+            document.status = DocumentStatus.FAILED
+            document.error_stage = "DEDUPLICATED"
+            document.error_message = f"已由真实PDF文档{duplicate_id}替代"
+            db.commit()
+            return "deduplicated"
         text, pages = parse_stored(document.raw_path) if document.raw_path else (document.raw_text or "", [(1, document.raw_text or "")])
         if not text.strip():
             raise ValueError("解析正文为空")
+        quality = assess_text_quality(text)
+        if document.document_type in {"ANNOUNCEMENT", "RESEARCH_REPORT"} and not quality.usable:
+            reason = "；".join(quality.warnings) or "正文质量不足"
+            raise ValueError(f"解析质量不足，未写入知识库：{reason}")
         document.parsed_text = text
+        document.parser_version = PARSER_VERSION
+        document.parse_quality = quality.score
+        document.parse_warnings = quality.warnings
         document.status = DocumentStatus.PARSED
         db.commit()
         result = extract_document(document)
@@ -46,13 +122,24 @@ def _process_document(db, document: Document) -> None:
         document.error_stage = None
         document.error_message = None
         db.commit()
-        index_document(db, document.id)
+        try:
+            index_document(db, document.id)
+        except Exception as exc:
+            document = db.get(Document, document.id)
+            document.status = DocumentStatus.EXTRACTED
+            document.error_stage = "INDEXING"
+            document.error_message = str(exc)[:2000]
+            db.commit()
+            raise
         document = db.get(Document, document.id)
         document.status = DocumentStatus.INDEXED
         db.commit()
+        return "indexed"
     except Exception as exc:
         db.rollback()
         document = db.get(Document, document.id)
+        if document.error_stage == "INDEXING" and document.status == DocumentStatus.EXTRACTED:
+            raise
         document.status = DocumentStatus.FAILED
         document.error_stage = "PROCESSING"
         document.error_message = str(exc)[:2000]
@@ -67,10 +154,10 @@ def process_document(self, document_id: int):
             document = db.get(Document, document_id)
             if not document:
                 return {"status": "missing"}
-            _process_document(db, document)
+            result = _process_document(db, document)
             if settings.vector_store_backend == "faiss":
                 rebuild_index(db)
-            return {"status": "indexed", "document_id": document_id}
+            return {"status": result, "document_id": document_id}
     except Exception as exc:
         raise self.retry(exc=exc, countdown=[5, 30, 120][min(self.request.retries, 2)])
 

@@ -60,6 +60,10 @@ class DocumentOut(ORMModel):
     author: str | None
     published_at: datetime | None
     summary: str | None
+    parser_version: str | None = None
+    parse_quality: float | None = None
+    parse_warnings: list[str] = Field(default_factory=list)
+    summary_method: str = "UNKNOWN"
     status: str
     error_stage: str | None
     error_message: str | None

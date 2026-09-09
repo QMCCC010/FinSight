@@ -2,6 +2,8 @@
 import { nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { ElMessage } from 'element-plus'
+import DOMPurify from 'dompurify'
+import { marked } from 'marked'
 import { use } from 'echarts/core'
 import { BarChart, CandlestickChart, LineChart, PieChart } from 'echarts/charts'
 import { DataZoomComponent, GridComponent, LegendComponent, TooltipComponent } from 'echarts/components'
@@ -44,6 +46,11 @@ const typeName: Record<string, string> = { RESEARCH_REPORT: '研报', NEWS: '新
 
 function isExternalSource(url?: string) {
   return Boolean(url && /^https?:\/\//i.test(url))
+}
+
+function formattedDocumentBody(text?: string) {
+  if (!text) return '<p>当前资料没有可展示的解析正文。</p>'
+  return DOMPurify.sanitize(marked.parse(text, { breaks: true, gfm: true }) as string)
 }
 
 async function openDocument(document: any) {
@@ -156,14 +163,15 @@ watch(() => route.params.code, load)
       <template #header><strong>{{ selectedDocument?.title || '资料详情' }}</strong></template>
       <div v-loading="documentLoading" class="document-detail">
         <template v-if="selectedDocument">
-          <div class="document-meta"><span class="doc-type">{{ typeName[selectedDocument.document_type] || selectedDocument.document_type }}</span><span>{{ selectedDocument.source_name }}</span><span>{{ selectedDocument.published_at?.slice(0, 10) || '时间未知' }}</span><span>{{ selectedDocument.status }}</span><span :class="['source-mode', selectedDocument.acquisition_mode?.toLowerCase()]">{{ selectedDocument.acquisition_mode === 'SNAPSHOT' ? '演示快照' : '在线采集' }}</span></div>
-          <section v-if="selectedDocument.summary"><h3>智能摘要</h3><p>{{ selectedDocument.summary }}</p></section>
+          <div class="document-meta"><span class="doc-type">{{ typeName[selectedDocument.document_type] || selectedDocument.document_type }}</span><span>{{ selectedDocument.source_name }}</span><span>{{ selectedDocument.published_at?.slice(0, 10) || '时间未知' }}</span><span>{{ selectedDocument.status }}</span><span :class="['source-mode', selectedDocument.acquisition_mode?.toLowerCase()]">{{ selectedDocument.acquisition_mode === 'SNAPSHOT' ? '演示快照' : '在线采集' }}</span><span v-if="selectedDocument.parse_quality != null" :class="selectedDocument.parse_quality >= 0.7 ? 'health-ok' : 'health-warning'">解析质量 {{ Math.round(selectedDocument.parse_quality * 100) }}%</span></div>
+          <div v-if="selectedDocument.parse_warnings?.length" class="parse-warning"><strong>解析提示</strong><span>{{ selectedDocument.parse_warnings.join('；') }}</span></div>
+          <section v-if="selectedDocument.summary"><h3>{{ selectedDocument.summary_method === 'LLM' ? '智能摘要' : '正文预览' }}</h3><small v-if="selectedDocument.summary_method !== 'LLM'" class="summary-note">本条资料未获得有效的大模型摘要，以下为清洗后的正文预览，不代表模型结论。</small><p>{{ selectedDocument.summary }}</p></section>
           <section v-if="selectedDocument.structured?.rating"><h3>投资评级</h3><div class="structured-card"><strong>{{ selectedDocument.structured.rating.institution || selectedDocument.source_name }}</strong><span>{{ selectedDocument.structured.rating.rating || '未提取' }}</span><span>目标价 {{ selectedDocument.structured.rating.target_price ?? '未披露' }}</span></div></section>
           <section v-if="selectedDocument.structured?.forecasts?.length"><h3>盈利预测</h3><el-table :data="selectedDocument.structured.forecasts" size="small"><el-table-column prop="year" label="年度" /><el-table-column prop="revenue" label="收入" /><el-table-column prop="net_profit" label="净利润" /><el-table-column prop="eps" label="EPS" /><el-table-column prop="unit" label="单位" /></el-table></section>
           <section v-if="selectedDocument.structured?.opinions?.length"><h3>核心观点</h3><ul><li v-for="(item,index) in selectedDocument.structured.opinions" :key="index">{{ item.content }}</li></ul></section>
           <section v-if="selectedDocument.structured?.risks?.length"><h3>风险提示</h3><ul><li v-for="(item,index) in selectedDocument.structured.risks" :key="index"><strong>{{ item.category }}</strong>：{{ item.content }}</li></ul></section>
           <details v-if="selectedDocument.evidences?.length" class="evidence-panel"><summary>查看 {{ selectedDocument.evidences.length }} 条结构化字段原文证据</summary><blockquote v-for="(item,index) in selectedDocument.evidences" :key="index"><small>{{ item.entity_type }}{{ item.page ? ` · 第${item.page}页` : '' }}</small><p>{{ item.quote }}</p></blockquote></details>
-          <section><h3>解析正文</h3><pre>{{ selectedDocument.parsed_text || '当前资料没有可展示的解析正文。' }}</pre></section>
+          <section><h3>格式化正文</h3><div class="formatted-document" v-html="formattedDocumentBody(selectedDocument.parsed_text)"></div></section>
           <div class="document-actions">
             <a v-if="isExternalSource(selectedDocument.source_url)" class="primary-button inline" :href="selectedDocument.source_url" target="_blank" rel="noopener">打开原始来源 ↗</a>
             <span v-else class="snapshot-note">这是本地演示快照，暂无外部原文地址。</span>
@@ -182,7 +190,13 @@ watch(() => route.params.code, load)
 .document-detail section { margin-top: 20px; }
 .document-detail h3 { margin: 0 0 10px; color: #18382e; }
 .document-detail p { line-height: 1.75; }
-.document-detail pre { max-height: 52vh; overflow: auto; padding: 18px; border-radius: 10px; background: #f6f8f4; white-space: pre-wrap; word-break: break-word; font: 13px/1.75 Inter, "Microsoft YaHei", sans-serif; }
+.formatted-document { max-height: 52vh; overflow: auto; padding: 18px; border-radius: 10px; background: #f6f8f4; word-break: break-word; font: 13px/1.75 Inter, "Microsoft YaHei", sans-serif; }
+.formatted-document :deep(p) { margin: 0 0 12px; }
+.formatted-document :deep(table) { width: 100%; margin: 12px 0; border-collapse: collapse; background: #fff; }
+.formatted-document :deep(th), .formatted-document :deep(td) { padding: 8px 10px; border: 1px solid #dfe5dc; text-align: left; vertical-align: top; }
+.formatted-document :deep(th) { position: sticky; top: 0; background: #edf2e8; color: #18382e; }
+.parse-warning { display: flex; gap: 10px; margin-top: 14px; padding: 10px 12px; border: 1px solid #e7c877; border-radius: 8px; background: #fff9e9; color: #775b17; font-size: 13px; }
+.summary-note { display: block; margin: -4px 0 8px; color: #8a7650; }
 .document-actions { display: flex; align-items: center; justify-content: flex-end; margin-top: 18px; }
 .snapshot-note { color: #7b877f; font-size: 13px; }
 .empty-state.compact { padding: 80px 20px; }

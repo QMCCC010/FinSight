@@ -52,6 +52,7 @@ class ExtractedRisk(BaseModel):
 
 class ExtractionResult(BaseModel):
     summary: str = ""
+    summary_method: str = "UNKNOWN"
     keywords: list[str] = Field(default_factory=list)
     institution: str | None = None
     analyst: str | None = None
@@ -271,6 +272,31 @@ def _extract_forecast_tables(text: str) -> list[ExtractedForecast]:
     return [merged[year] for year in sorted(merged)]
 
 
+def _fallback_summary(document: Document, text: str, limit: int = 240) -> str:
+    """Build a readable preview and avoid presenting page furniture as a summary."""
+    title = re.sub(r"\s+", "", getattr(document, "title", "") or "")
+    boilerplate = (
+        "证券代码", "证券简称", "公告编号", "本公司及董事会全体成员",
+        "本公司董事会及全体董事", "重要内容提示", "特别提示",
+        "请务必阅读", "免责声明", "投资评级说明",
+    )
+    candidates: list[str] = []
+    for raw_line in text.splitlines():
+        line = re.sub(r"\s+", " ", raw_line).strip(" |")
+        compact = re.sub(r"\s+", "", line)
+        if not line or compact == title or line.startswith("| ---"):
+            continue
+        if any(compact.startswith(marker) for marker in boilerplate):
+            continue
+        if len(re.findall(r"[\u3400-\u9fffA-Za-z0-9]", line)) < 8:
+            continue
+        candidates.append(line)
+        if len(" ".join(candidates)) >= limit * 2:
+            break
+    source = " ".join(candidates) or re.sub(r"\s+", " ", text).strip()
+    return source[:limit] + ("……" if len(source) > limit else "")
+
+
 def rule_based_extract(document: Document) -> ExtractionResult:
     raw_text = document.parsed_text or document.raw_text or ""
     text = raw_text.replace(",", "")
@@ -303,9 +329,9 @@ def rule_based_extract(document: Document) -> ExtractionResult:
                 ))
     sentiment = normalize_rating(rating) or ("SLIGHTLY_NEGATIVE" if risks and not opinions else "NEUTRAL")
     score = {"POSITIVE": 0.8, "SLIGHTLY_POSITIVE": 0.4, "NEUTRAL": 0, "SLIGHTLY_NEGATIVE": -0.4, "NEGATIVE": -0.8}.get(sentiment, 0)
-    summary_source = re.sub(r"\s+", " ", text).strip()
     return ExtractionResult(
-        summary=summary_source[:240] + ("……" if len(summary_source) > 240 else ""),
+        summary=_fallback_summary(document, raw_text),
+        summary_method="PREVIEW",
         keywords=list(dict.fromkeys(re.findall(r"[\u4e00-\u9fa5]{4,8}", document.title)))[:5],
         institution=document.source_name,
         original_rating=rating,
@@ -348,6 +374,11 @@ risks[category,content,confidence,evidence,page]。
         if not payload:
             return fallback
         result = ExtractionResult.model_validate(payload)
+        if result.summary.strip():
+            result.summary_method = "LLM"
+        else:
+            result.summary = fallback.summary
+            result.summary_method = fallback.summary_method
         result.original_rating = clean_rating(result.original_rating) or fallback.original_rating
         result.previous_rating = clean_rating(result.previous_rating)
         if not result.rating_evidence and result.original_rating == fallback.original_rating:
@@ -388,6 +419,7 @@ def persist_extraction(db: Session, document: Document, result: ExtractionResult
         db.execute(delete(model).where(model.document_id == document.id))
     db.execute(delete(Evidence).where(Evidence.document_id == document.id))
     document.summary = result.summary
+    document.summary_method = result.summary_method
     document.keywords = result.keywords
     if document.document_type == "RESEARCH_REPORT" and (result.original_rating or result.target_price is not None):
         rating = InvestmentRating(company_id=document.company_id, document_id=document.id, institution=result.institution or document.source_name, analyst=result.analyst, original_rating=result.original_rating, normalized_rating=normalize_rating(result.original_rating), previous_rating=result.previous_rating, target_price=result.target_price, currency="CNY")
