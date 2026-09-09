@@ -187,10 +187,16 @@ def _faiss_hybrid_search(
     document_types: list[str] | None = None,
     date_from: datetime | None = None,
     date_to: datetime | None = None,
+    company_ids: list[int] | None = None,
 ) -> list[dict]:
-    chunk_query = select(DocumentChunk).join(Document, Document.id == DocumentChunk.document_id).where(Document.is_deleted.is_(False))
+    chunk_query = select(DocumentChunk).join(Document, Document.id == DocumentChunk.document_id).where(
+        Document.status == "INDEXED",
+        Document.is_deleted.is_(False),
+    )
     if company_id is not None:
         chunk_query = chunk_query.where(DocumentChunk.company_id == company_id)
+    elif company_ids:
+        chunk_query = chunk_query.where(DocumentChunk.company_id.in_(company_ids))
     if document_types:
         chunk_query = chunk_query.where(Document.document_type.in_(document_types))
     if date_from:
@@ -278,6 +284,7 @@ def hybrid_search(
     document_types: list[str] | None = None,
     date_from: datetime | None = None,
     date_to: datetime | None = None,
+    company_ids: list[int] | None = None,
 ) -> list[dict]:
     settings = get_settings()
     if settings.vector_store_backend == "milvus":
@@ -285,12 +292,12 @@ def hybrid_search(
             from app.ai.milvus_store import hybrid_search as milvus_hybrid_search
 
             return milvus_hybrid_search(
-                query, company_id, limit, document_types, date_from, date_to
+                query, company_id, limit, document_types, date_from, date_to, company_ids
             )
         except Exception as exc:
             if not settings.vector_store_fallback:
                 raise
             logger.warning("Milvus retrieval failed; falling back to local FAISS/BM25: %s", exc)
     return _faiss_hybrid_search(
-        db, query, company_id, limit, document_types, date_from, date_to
+        db, query, company_id, limit, document_types, date_from, date_to, company_ids
     )

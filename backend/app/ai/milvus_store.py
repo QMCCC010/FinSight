@@ -216,10 +216,14 @@ def _filter_expression(
     document_types: list[str] | None,
     date_from: datetime | None,
     date_to: datetime | None,
+    company_ids: list[int] | None = None,
 ) -> str:
     conditions = ["is_deleted == false"]
     if company_id is not None:
         conditions.append(f"company_id == {int(company_id)}")
+    elif company_ids:
+        values = ", ".join(str(int(item)) for item in company_ids)
+        conditions.append(f"company_id in [{values}]")
     if document_types:
         values = ", ".join(f'"{_escape(item)}"' for item in document_types)
         conditions.append(f"document_type in [{values}]")
@@ -250,12 +254,13 @@ def hybrid_search(
     document_types: list[str] | None,
     date_from: datetime | None,
     date_to: datetime | None,
+    company_ids: list[int] | None = None,
 ) -> list[dict]:
     from pymilvus import AnnSearchRequest, RRFRanker
     from app.ai.index import embed_texts
 
     ensure_collection()
-    expression = _filter_expression(company_id, document_types, date_from, date_to)
+    expression = _filter_expression(company_id, document_types, date_from, date_to, company_ids)
     candidate_limit = max(20, limit * 4)
     vector = embed_texts([query])[0].tolist()
     requests = [

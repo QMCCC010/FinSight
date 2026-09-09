@@ -12,7 +12,9 @@ const question = ref('')
 const sending = ref(false)
 const controlling = ref<number | null>(null)
 let timer: number | undefined
+let reconnectTimer: number | undefined
 let streamAbort: AbortController | undefined
+let streamHealthy = false
 const terminalStatuses = ['COMPLETED', 'PARTIAL', 'FAILED', 'CANCELLED', 'NEEDS_CLARIFICATION']
 
 async function loadSessions() {
@@ -30,9 +32,13 @@ async function openSession(id: number) {
   startMessageStream(id)
 }
 async function refreshMessages() {
-  if (activeSession.value) messages.value = (await api.get(`/chat/sessions/${activeSession.value}/messages`)).data
+  const sessionId = activeSession.value
+  if (!sessionId) return
+  const data = (await api.get(`/chat/sessions/${sessionId}/messages`)).data
+  if (activeSession.value === sessionId) messages.value = data
 }
 async function startMessageStream(id: number) {
+  if (reconnectTimer) { window.clearTimeout(reconnectTimer); reconnectTimer = undefined }
   streamAbort?.abort()
   const controller = new AbortController()
   streamAbort = controller
@@ -43,6 +49,7 @@ async function startMessageStream(id: number) {
       signal: controller.signal,
     })
     if (!response.ok || !response.body) throw new Error('SSE unavailable')
+    streamHealthy = true
     const reader = response.body.getReader()
     const decoder = new TextDecoder()
     let buffer = ''
@@ -54,20 +61,31 @@ async function startMessageStream(id: number) {
       buffer = blocks.pop() || ''
       for (const block of blocks) {
         const dataLine = block.split('\n').find(line => line.startsWith('data: '))
-        if (dataLine && activeSession.value === id) messages.value = JSON.parse(dataLine.slice(6))
+        if (dataLine && activeSession.value === id) {
+          try { messages.value = JSON.parse(dataLine.slice(6)) } catch { /* wait for the next complete SSE event */ }
+        }
       }
     }
   } catch (error: any) {
     if (error?.name !== 'AbortError') await refreshMessages()
+  } finally {
+    if (streamAbort === controller) {
+      streamHealthy = false
+      if (!controller.signal.aborted) {
+        reconnectTimer = window.setTimeout(() => { if (activeSession.value === id) void startMessageStream(id) }, 3000)
+      }
+    }
   }
 }
 async function send() {
-  if (!question.value.trim()) return
+  if (sending.value || !question.value.trim()) return
   if (!activeSession.value) await newSession()
   sending.value = true
   try {
     const { data } = await api.post(`/chat/sessions/${activeSession.value}/messages`, { question: question.value })
     messages.value.push(data); question.value = ''; await nextTick()
+  } catch (error: any) {
+    ElMessage.error(error.response?.data?.detail || '问题提交失败，请稍后重试')
   } finally { sending.value = false }
 }
 function replaceMessage(data: any) {
@@ -75,7 +93,7 @@ function replaceMessage(data: any) {
   if (index >= 0) messages.value[index] = data
 }
 function waitingSeconds(message: any) {
-  return Math.max(0, Math.floor((Date.now() - new Date(message.updated_at || message.created_at).getTime()) / 1000))
+  return Math.max(0, Math.floor((Date.now() - new Date(message.created_at).getTime()) / 1000))
 }
 async function cancelMessage(message: any) {
   controlling.value = message.id
@@ -103,6 +121,9 @@ async function resolveCompany(message: any, stockCode: string) {
   try {
     const { data } = await api.post(`/chat/messages/${message.id}/resolve-company`, { stock_code: stockCode })
     replaceMessage(data)
+  } catch (error: any) {
+    ElMessage.error(error.response?.data?.detail || '公司确认失败，请刷新后重试')
+    await refreshMessages()
   } finally { controlling.value = null }
 }
 function externalSource(url?: string) { return Boolean(url && /^https?:\/\//i.test(url)) }
@@ -114,7 +135,7 @@ function refreshTone(status?: string) {
   return 'refresh-active'
 }
 function statusLabel(status?: string) {
-  return ({ QUEUED: '排队中', RESOLVING_ENTITY: '识别标的', COLLECTING: '首次采集', PROCESSING: '检索分析', ANSWERING: '生成回答', COMPLETED: '已完成', PARTIAL: '部分完成', FAILED: '失败', CANCELLED: '已停止' } as Record<string, string>)[status || ''] || status || '-'
+  return ({ QUEUED: '排队中', RESOLVING_ENTITY: '识别标的', COLLECTING: '首次采集', PROCESSING: '检索分析', ANSWERING: '生成回答', NEEDS_CLARIFICATION: '需要确认', COMPLETED: '已完成', PARTIAL: '部分完成', FAILED: '失败', CANCELLED: '已停止' } as Record<string, string>)[status || ''] || status || '-'
 }
 function sourceLabel(source?: string) {
   return ({ RESEARCH_REPORT: '券商研报', NEWS: '财经新闻', ANNOUNCEMENT: '公司公告', SOCIAL: '公开舆情', MARKET_DATA: '行情数据' } as Record<string, string>)[source || ''] || source || '资料'
@@ -122,7 +143,10 @@ function sourceLabel(source?: string) {
 function resolvedSubject(message: any) { return message.analysis_metadata?.resolved_subject }
 function renderMarkdown(content?: string) {
   if (!content) return ''
-  return DOMPurify.sanitize(marked.parse(content, { async: false }) as string, { USE_PROFILES: { html: true } })
+  return DOMPurify.sanitize(marked.parse(content, { async: false }) as string, {
+    USE_PROFILES: { html: true },
+    FORBID_TAGS: ['img', 'iframe', 'object', 'embed', 'script', 'style'],
+  })
 }
 function progressSteps(message: any) {
   const steps = [
@@ -142,8 +166,8 @@ function validationLabel(message: any) {
   if (validation.mode === 'LLM_REPAIRED') return '自动修订后通过校验'
   return validation.valid ? '引用与数字校验通过' : '已降级为安全回答'
 }
-onMounted(async () => { await loadSessions(); if (!activeSession.value) await newSession(); timer = window.setInterval(refreshMessages, 10000) })
-onUnmounted(() => { if (timer) window.clearInterval(timer); streamAbort?.abort() })
+onMounted(async () => { await loadSessions(); if (!activeSession.value) await newSession(); timer = window.setInterval(() => { if (!streamHealthy) void refreshMessages() }, 10000) })
+onUnmounted(() => { if (timer) window.clearInterval(timer); if (reconnectTimer) window.clearTimeout(reconnectTimer); streamAbort?.abort() })
 </script>
 
 <template>
@@ -161,7 +185,7 @@ onUnmounted(() => { if (timer) window.clearInterval(timer); streamAbort?.abort()
             <div v-else-if="message.status === 'FAILED'" class="error-box"><p>{{ message.error || message.status_text }}</p><button class="retry-button" :disabled="controlling === message.id" @click="retryMessage(message)">重新执行</button></div>
             <div v-else-if="message.status === 'CANCELLED'" class="cancelled-box"><p>{{ message.status_text }}</p><button class="retry-button" :disabled="controlling === message.id" @click="retryMessage(message)">重新执行</button></div>
             <div v-else-if="message.status === 'NEEDS_CLARIFICATION'" class="clarification-box"><strong>{{ message.status_text }}</strong><p>请选择准确标的，系统不会在公司不明确时猜测。</p><div class="candidate-buttons"><button v-for="candidate in message.clarification_candidates || []" :key="candidate.stock_code" :disabled="controlling === message.id" @click="resolveCompany(message, candidate.stock_code)">{{ candidate.name }}（{{ candidate.stock_code }} · {{ candidate.exchange_label || candidate.exchange }}）</button></div></div>
-            <div v-else class="answer-content"><div v-if="resolvedSubject(message)" class="entity-confirmation compact"><strong>{{ resolvedSubject(message).name }}<template v-if="resolvedSubject(message).stock_code">（{{ resolvedSubject(message).stock_code }}）</template></strong><span>{{ resolvedSubject(message).exchange_label }} · {{ resolvedSubject(message).listing_status }}</span></div><div class="answer-meta"><span :class="`status-${message.status.toLowerCase()}`">{{ statusLabel(message.status) }}</span><span>{{ message.analysis_metadata?.research_intent_label || '综合研究' }}</span><span>可信度 {{ message.confidence || '-' }}</span><span>资料截至 {{ formatDate(message.data_as_of) }}</span><span>{{ validationLabel(message) }}</span></div><div v-if="message.refresh_status" class="refresh-notice" :class="refreshTone(message.refresh_status)"><strong>后台资料更新 · {{ statusLabel(message.refresh_status) }}</strong><span>{{ message.refresh_status_text }}</span><small v-if="['QUEUED', 'RUNNING'].includes(message.refresh_status)">当前回答已经完成，无需等待；更新完成后会自动进入共享知识库，供后续问题使用。</small></div><div v-if="message.analysis_metadata?.retrieval_scope?.intent_fallback_used" class="partial-warning">首选资料类型不足，本次已回退检索该公司的其他资料，结论可能不够完整。</div><div v-if="message.missing_sources?.length" class="partial-warning">本次回答缺少部分来源：{{ message.missing_sources.map(sourceLabel).join('、') }}</div><div class="markdown-text" v-html="renderMarkdown(message.answer)"></div><details v-if="message.citations?.length"><summary>查看 {{ message.citations.length }} 条证据来源</summary><component :is="externalSource(citation.source_url) ? 'a' : 'div'" v-for="(citation, index) in message.citations" :key="index" :href="externalSource(citation.source_url) ? citation.source_url : undefined" target="_blank" rel="noopener" class="citation"><strong>[{{ index + 1 }}] {{ citation.title }}</strong><p>{{ citation.quote }}</p><small>{{ sourceLabel(citation.source_type) }} · {{ citation.page ? `第${citation.page}页` : citation.source_type === 'MARKET_DATA' ? '结构化行情' : '网页正文' }} · {{ externalSource(citation.source_url) ? '打开原文 ↗' : citation.source_name || '本地演示快照' }}</small></component></details></div>
+            <div v-else class="answer-content"><div v-if="resolvedSubject(message)" class="entity-confirmation compact"><strong>{{ resolvedSubject(message).name }}<template v-if="resolvedSubject(message).stock_code">（{{ resolvedSubject(message).stock_code }}）</template></strong><span>{{ resolvedSubject(message).exchange_label }} · {{ resolvedSubject(message).listing_status }}</span></div><div class="answer-meta"><span :class="`status-${message.status.toLowerCase()}`">{{ statusLabel(message.status) }}</span><span>{{ message.analysis_metadata?.research_intent_label || '综合研究' }}</span><span>可信度 {{ message.confidence || '-' }}</span><span>资料截至 {{ formatDate(message.data_as_of) }}</span><span>{{ validationLabel(message) }}</span></div><div v-if="message.refresh_status" class="refresh-notice" :class="refreshTone(message.refresh_status)"><strong>后台资料更新 · {{ statusLabel(message.refresh_status) }}</strong><span>{{ message.refresh_status_text }}</span><small v-if="['QUEUED', 'RUNNING'].includes(message.refresh_status)">当前回答已经完成，无需等待；更新完成后会自动进入共享知识库，供后续问题使用。</small></div><div v-if="message.analysis_metadata?.retrieval_scope?.recency_fallback_used" class="partial-warning">近180天内相关证据不足，本次使用了更早的历史资料，请注意资料日期。</div><div v-if="message.analysis_metadata?.retrieval_scope?.intent_fallback_used" class="partial-warning">首选资料类型不足，本次已回退检索该公司的其他资料，结论可能不够完整。</div><div v-if="message.analysis_metadata?.failed_tools?.length" class="partial-warning">部分分析工具暂时不可用，回答已使用其余有效证据降级完成。</div><div v-if="message.missing_sources?.length" class="partial-warning">本次回答缺少部分来源：{{ message.missing_sources.map(sourceLabel).join('、') }}</div><div class="markdown-text" v-html="renderMarkdown(message.answer)"></div><details v-if="message.citations?.length"><summary>查看 {{ message.citations.length }} 条证据来源</summary><component :is="externalSource(citation.source_url) ? 'a' : 'div'" v-for="(citation, index) in message.citations" :key="index" :href="externalSource(citation.source_url) ? citation.source_url : undefined" target="_blank" rel="noopener" class="citation"><strong>[{{ index + 1 }}] {{ citation.title }}</strong><p>{{ citation.quote }}</p><small>{{ sourceLabel(citation.source_type) }} · {{ citation.page ? `第${citation.page}页` : citation.source_type === 'MARKET_DATA' ? '结构化行情' : '网页正文' }} · {{ externalSource(citation.source_url) ? '打开原文 ↗' : citation.source_name || '本地演示快照' }}</small></component></details></div>
           </div>
         </article>
       </div>

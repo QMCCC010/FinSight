@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class ORMModel(BaseModel):
@@ -87,7 +87,15 @@ class Citation(BaseModel):
 
 
 class CreateChatSession(BaseModel):
-    title: str = Field(default="新对话", max_length=255)
+    title: str = Field(default="新对话", min_length=1, max_length=255)
+
+    @field_validator("title")
+    @classmethod
+    def normalize_title(cls, value: str) -> str:
+        value = " ".join(value.split())
+        if not value:
+            raise ValueError("会话标题不能为空")
+        return value
 
 
 class ChatSessionOut(ORMModel):
@@ -98,7 +106,15 @@ class ChatSessionOut(ORMModel):
 
 
 class CreateMessage(BaseModel):
-    question: str = Field(min_length=2, max_length=4000)
+    question: str = Field(min_length=2, max_length=2000)
+
+    @field_validator("question")
+    @classmethod
+    def normalize_question(cls, value: str) -> str:
+        value = value.strip()
+        if len(value) < 2:
+            raise ValueError("问题至少需要2个字符")
+        return value
 
 
 class ResolveCompanyRequest(BaseModel):

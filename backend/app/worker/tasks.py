@@ -162,6 +162,33 @@ def process_document(self, document_id: int):
         raise self.retry(exc=exc, countdown=[5, 30, 120][min(self.request.retries, 2)])
 
 
+def _dispatch_agent_message(db, message: ChatMessage) -> bool:
+    """Publish a resumable chat delivery with a persisted execution token."""
+    execution_id = str(uuid4())
+    message.task_id = execution_id
+    db.commit()
+    try:
+        run_agent_message.apply_async(
+            args=[message.id, execution_id],
+            task_id=execution_id,
+            queue="chat",
+            priority=9,
+            expires=300,
+        )
+        return True
+    except Exception:
+        logger.exception("Failed to enqueue resumed chat message %s", message.id)
+        message = db.get(ChatMessage, message.id)
+        if message and message.task_id == execution_id and message.status != MessageStatus.CANCELLED:
+            message.status = MessageStatus.FAILED
+            message.progress = 100
+            message.status_text = "问答队列不可用"
+            message.error = "资料处理已完成，但恢复问答失败，请点击重新执行。"
+            message.task_id = None
+            db.commit()
+        return False
+
+
 @shared_task(name="app.worker.tasks.collect_company")
 def collect_company(run_id: int, source_types: list[str] | None = None):
     redis = Redis.from_url(settings.redis_url, decode_responses=True)
@@ -225,9 +252,7 @@ def collect_company(run_id: int, source_types: list[str] | None = None):
             db.commit()
             if active and active.status in (RunStatus.COMPLETED, RunStatus.PARTIAL):
                 for message in foreground:
-                    result = run_agent_message.apply_async(args=[message.id], queue="chat", priority=9, expires=300)
-                    message.task_id = result.id
-                db.commit()
+                    _dispatch_agent_message(db, message)
             return {"status": "deduplicated"}
         run.status = RunStatus.RUNNING
         run.started_at = datetime.now()
@@ -349,9 +374,7 @@ def collect_company(run_id: int, source_types: list[str] | None = None):
                     message.error = "所有可用来源均未形成可索引证据，请稍后重试或检查数据源。"
             db.commit()
             for message in (item for item in waiting if item.status == MessageStatus.QUEUED):
-                result = run_agent_message.apply_async(args=[message.id], queue="chat", priority=9, expires=300)
-                message.task_id = result.id
-            db.commit()
+                _dispatch_agent_message(db, message)
             return {"status": run.status, "created": run.created_count, "duplicates": run.duplicate_count, "missing_sources": run.missing_sources}
         except Exception as exc:
             db.rollback()
@@ -400,18 +423,25 @@ def delete_from_vector_index(document_id: int):
     return {"document_id": document_id, "deleted": True}
 
 
-@shared_task(name="app.worker.tasks.run_agent_message")
-def run_agent_message(message_id: int):
+@shared_task(name="app.worker.tasks.run_agent_message", ignore_result=True)
+def run_agent_message(message_id: int, execution_id: str | None = None):
     try:
         with SessionLocal() as db:
             message = db.get(ChatMessage, message_id)
             if not message or message.status == MessageStatus.CANCELLED:
                 return {"status": "cancelled", "message_id": message_id}
-        return run_message(message_id)
+            if execution_id and message.task_id != execution_id:
+                return {"status": "superseded", "message_id": message_id}
+        result = run_message(message_id, execution_id)
+        if result.get("status") in {"cancelled_or_superseded", "superseded"}:
+            return {"status": result["status"], "message_id": message_id}
+        with SessionLocal() as db:
+            message = db.get(ChatMessage, message_id)
+            return {"status": str(message.status) if message else "missing", "message_id": message_id}
     except SoftTimeLimitExceeded:
         with SessionLocal() as db:
             message = db.get(ChatMessage, message_id)
-            if message and message.status != MessageStatus.CANCELLED:
+            if message and message.status != MessageStatus.CANCELLED and (not execution_id or message.task_id == execution_id):
                 message.status = MessageStatus.FAILED
                 message.progress = 100
                 message.status_text = "问答执行超时"
@@ -422,7 +452,7 @@ def run_agent_message(message_id: int):
         logger.exception("Agent task failed for message %s", message_id)
         with SessionLocal() as db:
             message = db.get(ChatMessage, message_id)
-            if message and message.status != MessageStatus.CANCELLED:
+            if message and message.status != MessageStatus.CANCELLED and (not execution_id or message.task_id == execution_id):
                 message.status = MessageStatus.FAILED
                 message.progress = 100
                 message.status_text = "Agent执行失败"

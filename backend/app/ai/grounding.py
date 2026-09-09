@@ -94,6 +94,19 @@ def _number_tokens(text: str) -> list[str]:
     return [token.replace(",", "") for token in re.findall(r"(?<![A-Za-z])\d[\d,]*(?:\.\d+)?%?", without_references)]
 
 
+def contains_direct_trading_advice(text: str) -> bool:
+    """Detect imperative portfolio/trading instructions, not quoted ratings."""
+    normalized = re.sub(r"\s+", "", text or "")
+    if re.search(r"(?:券商|机构|分析师).{0,8}(?:给予|维持|评级为|建议).{0,4}(?:买入|卖出|增持|减持)", normalized):
+        return False
+    patterns = (
+        r"(?:建议|应该|应当|务必|立即|马上|现在就)(?:你|投资者|用户)?(?:直接|立即|马上|考虑)?(?:买入|卖出|加仓|减仓|清仓|满仓|建仓)",
+        r"(?:你|投资者|用户).{0,8}(?:可以买入|应买入|应卖出|加仓|减仓|清仓|满仓|建仓)",
+        r"(?:仓位|持仓)(?:应|建议|控制在|提高到|降低到).{0,8}\d+(?:\.\d+)?%",
+    )
+    return any(re.search(pattern, normalized) for pattern in patterns)
+
+
 def validate_grounded_answer(answer: str, citations: list[dict[str, Any]]) -> dict[str, Any]:
     """Check citation integrity and whether numeric claims are source-backed.
 
@@ -129,6 +142,8 @@ def validate_grounded_answer(answer: str, citations: list[dict[str, Any]]) -> di
         if segment.startswith("#") or "不构成投资建议" in segment:
             continue
         segment_references = [number for number in _citation_references(segment) if number in valid_numbers]
+        if contains_direct_trading_advice(segment):
+            issues.append({"code": "DIRECT_TRADING_ADVICE", "text": segment[:180]})
         # Markdown table headers are labels, not factual claims. Data rows carry
         # their own citation in the final column and continue through validation.
         if segment.startswith("|") and not segment_references and not re.search(r"\d", segment):
@@ -170,7 +185,7 @@ def validate_grounded_answer(answer: str, citations: list[dict[str, Any]]) -> di
 
 def filter_unsupported_lines(answer: str, citations: list[dict[str, Any]]) -> tuple[str, dict[str, Any]]:
     """Keep safe LLM paragraphs and remove only unsupported material claims."""
-    blocking_codes = {"INVALID_CITATION", "UNCITED_NUMBER", "UNSUPPORTED_NUMBER", "UNCITED_FACT"}
+    blocking_codes = {"INVALID_CITATION", "UNCITED_NUMBER", "UNSUPPORTED_NUMBER", "UNCITED_FACT", "DIRECT_TRADING_ADVICE"}
     kept: list[str] = []
     removed = 0
     for line in answer.splitlines():

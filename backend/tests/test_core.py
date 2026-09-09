@@ -11,14 +11,14 @@ from app.ai.extraction import clean_rating, extract_document, normalize_rating, 
 from app.ai.broker_comparison import build_broker_citations, build_broker_comparison_answer
 from app.api.routers.analysis import _cluster_statements, _forecast_ranges
 from app.api.routers.companies import _event_similarity
-from app.ai.graph import classify_intent, classify_refresh_sources, route_after_check
-from app.ai.grounding import classify_research_intent, filter_unsupported_lines, intent_document_types, is_professional_risk_item, validate_grounded_answer
+from app.ai.graph import _build_financial_citations, _citation_data_as_of, _compact_prompt_value, _company_hit_relevant, _matches_common_company_short_name, _retrieval_question, classify_intent, classify_refresh_sources, route_after_check, route_after_retrieval
+from app.ai.grounding import classify_research_intent, contains_direct_trading_advice, filter_unsupported_lines, intent_document_types, is_professional_risk_item, validate_grounded_answer
 from app.ai.milvus_store import _filter_expression
 from app.ai.reporting import _clusters, _metric_label, _safe_llm_summary
 from app.collector.demo_data import demo_items
 from app.collector.adapters.announcement import cninfo_pdf_url
 from app.core.security import hash_password, verify_password
-from app.core.schemas import ReportComparisonRequest
+from app.core.schemas import CreateChatSession, CreateMessage, ReportComparisonRequest
 from app.services.parser import assess_text_quality, chunk_pages, normalize_text, parse_pdf
 from app.services.report_export import export_docx, export_pdf
 from app.services.crawl_runs import normalize_source_types, run_covers, run_source_types
@@ -167,6 +167,20 @@ def test_milvus_filter_is_applied_before_hybrid_search():
     assert "published_ts <=" in expression
 
 
+def test_milvus_filter_can_restrict_an_industry_company_set():
+    expression = _filter_expression(None, ["NEWS"], None, None, [3, 7, 9])
+    assert "company_id in [3, 7, 9]" in expression
+
+
+def test_chat_input_is_trimmed_and_bounded():
+    assert CreateMessage(question="  宁德时代有什么风险？  ").question == "宁德时代有什么风险？"
+    assert CreateChatSession(title="  我的   研究  ").title == "我的 研究"
+    with pytest.raises(ValueError):
+        CreateMessage(question="   ")
+    with pytest.raises(ValueError):
+        CreateMessage(question="问" * 2001)
+
+
 def test_system_questions_bypass_company_resolution():
     assert classify_intent("你好，你是什么模型？") == "SYSTEM_META"
     assert classify_intent("你能做什么") == "SYSTEM_META"
@@ -177,6 +191,12 @@ def test_system_questions_bypass_company_resolution():
     assert classify_intent("这个系统能做什么？") == "SYSTEM_META"
     assert classify_intent("比亚迪最近有哪些风险") == "COMPANY_RESEARCH"
     assert classify_intent("比亚迪汽车有哪些功能？") == "COMPANY_RESEARCH"
+
+
+def test_common_company_short_name_matching_is_conservative():
+    assert _matches_common_company_short_name(SimpleNamespace(name="贵州茅台"), "茅台最近行情怎么样")
+    assert _matches_common_company_short_name(SimpleNamespace(name="中国平安"), "平安最近有什么公告")
+    assert not _matches_common_company_short_name(SimpleNamespace(name="比亚迪"), "汽车行业怎么样")
 
 
 def test_question_intent_routes_are_explicit():
@@ -191,11 +211,69 @@ def test_stale_existing_knowledge_answers_first_and_refreshes_in_background():
     assert route_after_check({"needs_collection": False, "needs_refresh": False}) == "retrieve_context"
 
 
+def test_structured_tools_can_survive_vector_retrieval_outage():
+    assert route_after_retrieval({"retrieved_documents": [], "research_intent": "MARKET_TREND"}) == "select_tools"
+    assert route_after_retrieval({"retrieved_documents": [], "research_intent": "FINANCIAL"}) == "select_tools"
+    assert route_after_retrieval({"retrieved_documents": [], "research_intent": "OVERVIEW"}) == "handle_failure"
+
+
+def test_financial_citations_keep_document_provenance_and_raw_value():
+    citations = _build_financial_citations([{
+        "document_id": 9,
+        "title": "年度报告",
+        "source_type": "ANNOUNCEMENT",
+        "source_url": "https://example.com/report.pdf",
+        "published_at": "2026-04-01T00:00:00",
+        "source_name": "巨潮资讯",
+        "name": "营业收入",
+        "raw_value": "100",
+        "unit": "亿元",
+        "period": "2025年",
+        "evidence": "2025年营业收入100亿元",
+        "page": 3,
+    }])
+    assert citations[0]["document_id"] == 9
+    assert "营业收入：100亿元" in citations[0]["quote"]
+    assert citations[0]["page"] == 3
+
+
 def test_background_refresh_only_requests_relevant_sources():
     assert classify_refresh_sources("比亚迪最近有哪些新闻，舆情怎么样？") == ["NEWS", "SOCIAL"]
     assert classify_refresh_sources("宁德时代目前的研报评级和盈利预测") == ["RESEARCH_REPORT"]
     assert classify_refresh_sources("赣锋锂业当前财务数据和公告") == ["ANNOUNCEMENT"]
     assert classify_refresh_sources("全面分析比亚迪") == ["RESEARCH_REPORT", "NEWS", "ANNOUNCEMENT", "SOCIAL"]
+    assert classify_refresh_sources("比亚迪有哪些主要风险") == ["RESEARCH_REPORT", "ANNOUNCEMENT", "NEWS"]
+
+
+def test_vague_follow_up_uses_recent_question_for_retrieval():
+    query = _retrieval_question({
+        "question": "那风险呢？",
+        "company_name": "宁德时代",
+        "conversation_questions": ["宁德时代最近的盈利预测有什么分歧？"],
+    })
+    assert "宁德时代" in query
+    assert "盈利预测" in query
+    assert "风险" in query
+
+
+def test_company_news_filter_rejects_incidental_single_mentions():
+    incidental = {"source_type": "NEWS", "title": "机器人企业上市", "quote": "客户包括一汽、宁德时代、比亚迪和多家制造企业。"}
+    focused = {"source_type": "NEWS", "title": "比亚迪发布投资者活动记录", "quote": "公司披露最新经营情况。"}
+    repeated = {"source_type": "NEWS", "title": "新能源汽车动态", "quote": "比亚迪公布销量，比亚迪海外业务继续增长。"}
+    assert not _company_hit_relevant(incidental, "比亚迪", "002594")
+    assert _company_hit_relevant(focused, "比亚迪", "002594")
+    assert _company_hit_relevant(repeated, "比亚迪", "002594")
+
+
+def test_prompt_context_is_bounded_and_citation_date_is_evidence_based():
+    compact = _compact_prompt_value({"rows": ["x" * 2000 for _ in range(30)]})
+    assert len(compact["rows"]) == 12
+    assert all(len(item) == 800 for item in compact["rows"])
+    actual = _citation_data_as_of(
+        [{"published_at": "2026-03-01T00:00:00"}, {"published_at": "2026-06-15T00:00:00"}],
+        datetime(2026, 9, 1),
+    )
+    assert actual == datetime(2026, 6, 15)
 
 
 def test_research_intent_drives_source_specific_retrieval():
@@ -224,6 +302,18 @@ def test_grounding_validation_rejects_uncited_or_invented_numbers():
     assert any(issue["code"] == "UNCITED_NUMBER" for issue in uncited["issues"])
     assert any(issue["code"] == "UNSUPPORTED_NUMBER" for issue in invented["issues"])
     assert any(issue["code"] == "INVALID_CITATION" for issue in invalid_reference["issues"])
+
+
+def test_grounding_rejects_direct_trading_and_position_advice():
+    citations = [{"title": "研报", "quote": "机构维持买入评级。"}]
+    answer = "建议立即买入并把仓位提高到80%[1]。"
+    result = validate_grounded_answer(answer, citations)
+    assert contains_direct_trading_advice(answer)
+    assert any(issue["code"] == "DIRECT_TRADING_ADVICE" for issue in result["issues"])
+    filtered, filtered_result = filter_unsupported_lines(answer, citations)
+    assert "立即买入" not in filtered
+    assert not filtered_result["valid"]  # caller must fall back to cited evidence
+    assert not contains_direct_trading_advice("国信证券维持买入评级[1]。")
 
 
 def test_grounding_validation_requires_citations_for_material_factual_claims():

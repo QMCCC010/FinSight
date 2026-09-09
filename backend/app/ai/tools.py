@@ -6,6 +6,7 @@ from sqlalchemy import func, select
 from app.ai.index import hybrid_search
 from app.ai.reporting import build_report
 from app.core.database import SessionLocal
+from app.core.enums import DocumentStatus
 from app.core.models import Company, Document, EarningsForecast, Evidence, FinancialMetric, InvestmentRating, MarketPrice, Opinion, RiskItem, SentimentResult
 
 
@@ -28,7 +29,11 @@ def get_company_overview(stock_code: str) -> dict:
     """查询公司基本信息和四类文档数量。"""
     with SessionLocal() as db:
         company = _company(db, stock_code)
-        counts = dict(db.execute(select(Document.document_type, func.count(Document.id)).where(Document.company_id == company.id, Document.is_deleted.is_(False)).group_by(Document.document_type)).all())
+        counts = dict(db.execute(select(Document.document_type, func.count(Document.id)).where(
+            Document.company_id == company.id,
+            Document.status == DocumentStatus.INDEXED,
+            Document.is_deleted.is_(False),
+        ).group_by(Document.document_type)).all())
         return {"stock_code": company.stock_code, "name": company.name, "exchange": company.exchange, "industry": company.industry, "tracking_mode": company.tracking_mode, "listing_status": "A股基础名单已确认", "document_counts": counts}
 
 
@@ -66,8 +71,40 @@ def get_financial_metrics(stock_code: str) -> list[dict]:
     """查询公司已经抽取的实际财务指标，预测数据不包含在内。"""
     with SessionLocal() as db:
         company = _company(db, stock_code)
-        rows = db.scalars(select(FinancialMetric).where(FinancialMetric.company_id == company.id).order_by(FinancialMetric.id.desc()).limit(20)).all()
-        return [{"name": row.metric_name, "value": row.normalized_value, "raw_value": row.raw_value, "unit": row.unit, "period": row.period, "yoy": row.yoy} for row in rows]
+        rows = db.execute(
+            select(FinancialMetric, Document)
+            .join(Document, Document.id == FinancialMetric.document_id)
+            .where(
+                FinancialMetric.company_id == company.id,
+                Document.status == DocumentStatus.INDEXED,
+                Document.is_deleted.is_(False),
+            )
+            .order_by(Document.published_at.desc(), FinancialMetric.id.desc())
+            .limit(20)
+        ).all()
+        result = []
+        for row, document in rows:
+            evidence = db.scalar(select(Evidence).where(
+                Evidence.entity_type == "financial_metric",
+                Evidence.entity_id == row.id,
+            ).order_by(Evidence.id.desc()))
+            result.append({
+                "name": row.metric_name,
+                "value": row.normalized_value,
+                "raw_value": row.raw_value,
+                "unit": row.unit,
+                "period": row.period,
+                "yoy": row.yoy,
+                "document_id": document.id,
+                "title": document.title,
+                "source_type": document.document_type,
+                "source_url": document.source_url,
+                "published_at": document.published_at.isoformat() if document.published_at else None,
+                "source_name": document.source_name,
+                "evidence": evidence.quote if evidence else "",
+                "page": evidence.page_number if evidence else None,
+            })
+        return result
 
 
 @tool
@@ -81,6 +118,7 @@ def get_broker_forecasts(stock_code: str) -> dict:
             .where(
                 EarningsForecast.company_id == company.id,
                 Document.document_type == "RESEARCH_REPORT",
+                Document.status == DocumentStatus.INDEXED,
                 Document.is_deleted.is_(False),
             )
             .order_by(Document.published_at.desc(), EarningsForecast.institution, EarningsForecast.forecast_year)
@@ -92,6 +130,7 @@ def get_broker_forecasts(stock_code: str) -> dict:
             .where(
                 InvestmentRating.company_id == company.id,
                 Document.document_type == "RESEARCH_REPORT",
+                Document.status == DocumentStatus.INDEXED,
                 Document.is_deleted.is_(False),
             )
             .order_by(Document.published_at.desc(), InvestmentRating.id.desc())
@@ -152,6 +191,7 @@ def compare_research_reports(stock_code: str) -> dict:
             .where(
                 Opinion.company_id == company.id,
                 Document.document_type == "RESEARCH_REPORT",
+                Document.status == DocumentStatus.INDEXED,
                 Document.is_deleted.is_(False),
             )
             .order_by(Document.published_at.desc(), Opinion.id.desc())
@@ -163,6 +203,7 @@ def compare_research_reports(stock_code: str) -> dict:
             .where(
                 RiskItem.company_id == company.id,
                 Document.document_type.in_(["RESEARCH_REPORT", "ANNOUNCEMENT"]),
+                Document.status == DocumentStatus.INDEXED,
                 Document.is_deleted.is_(False),
             )
             .order_by(Document.published_at.desc(), RiskItem.id.desc())
@@ -196,7 +237,17 @@ def compare_research_reports(stock_code: str) -> dict:
 def _sentiment(stock_code: str, document_type: str) -> dict:
     with SessionLocal() as db:
         company = _company(db, stock_code)
-        rows = db.execute(select(SentimentResult.sentiment, func.count(SentimentResult.id), func.avg(SentimentResult.score)).join(Document, Document.id == SentimentResult.document_id).where(SentimentResult.company_id == company.id, Document.document_type == document_type).group_by(SentimentResult.sentiment)).all()
+        rows = db.execute(
+            select(SentimentResult.sentiment, func.count(SentimentResult.id), func.avg(SentimentResult.score))
+            .join(Document, Document.id == SentimentResult.document_id)
+            .where(
+                SentimentResult.company_id == company.id,
+                Document.document_type == document_type,
+                Document.status == DocumentStatus.INDEXED,
+                Document.is_deleted.is_(False),
+            )
+            .group_by(SentimentResult.sentiment)
+        ).all()
         return {"distribution": {row[0]: row[1] for row in rows}, "average_scores": {row[0]: float(row[2]) for row in rows}}
 
 
