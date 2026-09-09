@@ -3,7 +3,7 @@ from difflib import SequenceMatcher
 import re
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.api.dependencies import get_current_user
@@ -76,6 +76,57 @@ def get_company(db: Session, stock_code: str) -> Company:
     return company
 
 
+def _to_yi(value: float | None, unit: str | None) -> float | None:
+    if value is None:
+        return None
+    return value / 100 if unit and "百万元" in unit else value
+
+
+def _forecast_ranges(rows: list[dict]) -> list[dict]:
+    """Build institution-deduplicated ranges for each forecast year."""
+    by_institution_year: dict[tuple[str, int], dict] = {}
+    for report in rows:
+        institution = report["institution"]
+        for item in report["forecasts"]:
+            key = (institution, item["year"])
+            # Reports are ordered newest first, so the first estimate from an
+            # institution is the relevant one for aggregate comparisons.
+            by_institution_year.setdefault(key, {**item, "institution": institution})
+
+    by_year: dict[int, list[dict]] = {}
+    for item in by_institution_year.values():
+        by_year.setdefault(item["year"], []).append(item)
+
+    result: list[dict] = []
+    for year, items in sorted(by_year.items()):
+        metrics: dict[str, dict | None] = {}
+        for key in ("revenue", "net_profit", "eps"):
+            values = []
+            for item in items:
+                raw = item.get(key)
+                value = raw if key == "eps" else _to_yi(raw, item.get("unit"))
+                if value is not None:
+                    values.append((float(value), item["institution"]))
+            if len({institution for _, institution in values}) < 2:
+                metrics[key] = None
+                continue
+            low = min(values, key=lambda entry: entry[0])
+            high = max(values, key=lambda entry: entry[0])
+            metrics[key] = {
+                "min": round(low[0], 2),
+                "max": round(high[0], 2),
+                "min_institution": low[1],
+                "max_institution": high[1],
+            }
+        if any(metrics.values()):
+            result.append({
+                "year": year,
+                "institution_count": len({item["institution"] for item in items}),
+                **metrics,
+            })
+    return result
+
+
 @router.post("/report-comparison")
 def compare_reports(
     payload: ReportComparisonRequest,
@@ -86,16 +137,59 @@ def compare_reports(
     base_filter = (
         Document.company_id == company.id,
         Document.document_type == "RESEARCH_REPORT",
+        Document.status == "INDEXED",
         Document.is_deleted.is_(False),
     )
     available_count = db.scalar(select(func.count(Document.id)).where(*base_filter)) or 0
-    query = select(Document).where(*base_filter)
+    scope_filters = []
     if payload.document_ids:
-        query = query.where(Document.id.in_(payload.document_ids))
+        scope_filters.append(Document.id.in_(payload.document_ids))
+    if payload.institutions:
+        scope_filters.append(or_(
+            InvestmentRating.institution.in_(payload.institutions),
+            Document.source_name.in_(payload.institutions),
+        ))
+    if payload.normalized_ratings:
+        scope_filters.append(InvestmentRating.normalized_rating.in_(payload.normalized_ratings))
+    if payload.date_from:
+        scope_filters.append(Document.published_at >= payload.date_from)
+    if payload.date_to:
+        scope_filters.append(Document.published_at <= payload.date_to)
+    query = (
+        select(Document)
+        .outerjoin(InvestmentRating, InvestmentRating.document_id == Document.id)
+        .where(*base_filter, *scope_filters)
+    )
     effective_limit = len(payload.document_ids) if payload.document_ids else payload.limit
-    documents = list(db.scalars(query.order_by(Document.published_at.desc()).limit(effective_limit)).all())
-    if payload.document_ids and len(documents) != len(set(payload.document_ids)):
+    candidate_limit = min(200, max(effective_limit, effective_limit * 5 if payload.latest_per_institution else effective_limit))
+    candidates = list(db.scalars(query.order_by(Document.published_at.desc(), Document.id.desc()).limit(candidate_limit)).unique().all())
+    filtered_available_count = db.scalar(
+        select(func.count(func.distinct(Document.id)))
+        .select_from(Document)
+        .outerjoin(InvestmentRating, InvestmentRating.document_id == Document.id)
+        .where(*base_filter, *scope_filters)
+    ) or 0
+    if payload.document_ids and len(candidates) != len(set(payload.document_ids)):
         raise HTTPException(status_code=400, detail="部分研报不存在或不属于所选公司")
+
+    rating_by_document = {
+        rating.document_id: rating
+        for rating in db.scalars(
+            select(InvestmentRating).where(InvestmentRating.document_id.in_([document.id for document in candidates] or [-1]))
+        ).all()
+    }
+    documents: list[Document] = []
+    seen_institutions: set[str] = set()
+    for document in candidates:
+        rating = rating_by_document.get(document.id)
+        institution = rating.institution if rating and rating.institution else document.source_name
+        if payload.comparison_mode == "CONSENSUS" and payload.latest_per_institution:
+            if institution in seen_institutions:
+                continue
+            seen_institutions.add(institution)
+        documents.append(document)
+        if len(documents) >= effective_limit:
+            break
 
     rows = []
     positive_points: list[dict] = []
@@ -103,7 +197,7 @@ def compare_reports(
     bearish_points: list[str] = []
     rating_entries: list[tuple[str, str, str]] = []
     for document in documents:
-        rating = db.scalar(select(InvestmentRating).where(InvestmentRating.document_id == document.id))
+        rating = rating_by_document.get(document.id)
         forecasts = list(db.scalars(select(EarningsForecast).where(EarningsForecast.document_id == document.id).order_by(EarningsForecast.forecast_year)).all())
         opinions = list(db.scalars(select(Opinion).where(Opinion.document_id == document.id)).all())
         risks = list(db.scalars(select(RiskItem).where(RiskItem.document_id == document.id)).all())
@@ -147,6 +241,8 @@ def compare_reports(
             "message": "当前可比较研报不足两篇，请先同步研报数据。",
             "reports": rows,
             "available_count": available_count,
+            "filtered_available_count": filtered_available_count,
+            "comparison_mode": payload.comparison_mode,
             "consensus": [],
             "common_risks": [],
             "differences": [],
@@ -155,7 +251,7 @@ def compare_reports(
         }
 
     consensus = _cluster_statements(positive_points, require_distinct_institutions=True)
-    common_risks = _cluster_statements(risk_points, require_distinct_institutions=False)
+    common_risks = _cluster_statements(risk_points, require_distinct_institutions=True)
     rating_counts = Counter(item[2] for item in rating_entries)
     if rating_counts:
         top_rating, top_count = rating_counts.most_common(1)[0]
@@ -172,12 +268,22 @@ def compare_reports(
         "status": "COMPLETED",
         "reports": rows,
         "available_count": available_count,
+        "filtered_available_count": filtered_available_count,
+        "comparison_mode": payload.comparison_mode,
+        "latest_per_institution": payload.latest_per_institution,
+        "forecast_ranges": _forecast_ranges(rows),
         "consensus": consensus[:5],
         "common_risks": common_risks,
         "differences": differences[:5],
         "consensus_message": "所选研报尚未抽取出至少两家机构共同支持的相似观点。" if not consensus else None,
-        "common_risks_message": "所选研报尚未发现被至少两篇报告共同提及的相似风险。" if not common_risks else None,
-        "summary": f"已从{available_count}篇可用研报中比较所选{len(rows)}篇；共识仅保留至少两篇报告支持的相似内容。",
+        "common_risks_message": "所选研报尚未发现被至少两家机构共同提及的相似风险。" if not common_risks else None,
+        "summary": (
+            f"全量共识模式从{filtered_available_count}篇符合条件的研报中分析{len(rows)}篇"
+            + ("，默认每家机构只保留最新一篇" if payload.latest_per_institution else "")
+            + "；共识仅保留至少两家机构共同支持的相似内容。"
+            if payload.comparison_mode == "CONSENSUS"
+            else f"已从{available_count}篇可用研报中比较所选{len(rows)}篇；共识仅保留至少两家机构支持的相似内容。"
+        ),
     }
 
 

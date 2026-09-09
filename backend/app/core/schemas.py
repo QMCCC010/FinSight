@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class ORMModel(BaseModel):
@@ -128,8 +128,25 @@ class ChatMessageOut(ORMModel):
 
 class ReportComparisonRequest(BaseModel):
     stock_code: str = Field(pattern=r"^\d{6}$")
-    document_ids: list[int] | None = Field(default=None, min_length=2, max_length=5)
-    limit: int = Field(default=5, ge=2, le=5)
+    comparison_mode: Literal["SELECTED", "CONSENSUS"] = "SELECTED"
+    document_ids: list[int] | None = Field(default=None, min_length=2, max_length=10)
+    limit: int = Field(default=5, ge=2, le=50)
+    institutions: list[str] = Field(default_factory=list, max_length=30)
+    normalized_ratings: list[Literal["POSITIVE", "SLIGHTLY_POSITIVE", "NEUTRAL", "SLIGHTLY_NEGATIVE", "NEGATIVE"]] = Field(default_factory=list, max_length=5)
+    date_from: datetime | None = None
+    date_to: datetime | None = None
+    latest_per_institution: bool = True
+
+    @model_validator(mode="after")
+    def validate_comparison_scope(self):
+        if self.comparison_mode == "SELECTED" and self.limit > 10:
+            raise ValueError("精选对比最多分析10篇研报")
+        if self.comparison_mode == "CONSENSUS" and self.document_ids:
+            raise ValueError("全量共识模式使用筛选条件，不接受手动研报ID")
+        if self.date_from and self.date_to and self.date_from > self.date_to:
+            raise ValueError("开始日期不能晚于结束日期")
+        self.institutions = list(dict.fromkeys(value.strip() for value in self.institutions if value.strip()))
+        return self
 
 
 class CreateReportRequest(BaseModel):

@@ -8,7 +8,7 @@ from billiard.exceptions import SoftTimeLimitExceeded
 
 from app.ai.extraction import clean_rating, extract_document, normalize_rating, rule_based_extract
 from app.ai.broker_comparison import build_broker_citations, build_broker_comparison_answer
-from app.api.routers.analysis import _cluster_statements
+from app.api.routers.analysis import _cluster_statements, _forecast_ranges
 from app.api.routers.companies import _event_similarity
 from app.ai.graph import classify_intent, classify_refresh_sources, route_after_check
 from app.ai.grounding import classify_research_intent, filter_unsupported_lines, intent_document_types, is_professional_risk_item, validate_grounded_answer
@@ -16,6 +16,7 @@ from app.ai.milvus_store import _filter_expression
 from app.ai.reporting import _clusters, _metric_label, _safe_llm_summary
 from app.collector.demo_data import demo_items
 from app.core.security import hash_password, verify_password
+from app.core.schemas import ReportComparisonRequest
 from app.services.parser import chunk_pages
 from app.services.report_export import export_docx, export_pdf
 from app.services.crawl_runs import normalize_source_types, run_covers, run_source_types
@@ -354,3 +355,37 @@ def test_structured_broker_comparison_is_cited_and_reports_real_ranges():
     assert "| 2026E |" in answer
     assert "评级方向总体一致" in answer
     assert validation["valid"], validation["issues"]
+
+
+def test_report_comparison_supports_ten_selected_and_fifty_consensus_reports():
+    selected = ReportComparisonRequest(
+        stock_code="300750",
+        comparison_mode="SELECTED",
+        document_ids=list(range(1, 11)),
+        limit=10,
+    )
+    consensus = ReportComparisonRequest(
+        stock_code="300750",
+        comparison_mode="CONSENSUS",
+        limit=50,
+        institutions=["国信证券", "国信证券", " 山西证券 "],
+    )
+    assert len(selected.document_ids or []) == 10
+    assert consensus.limit == 50
+    assert consensus.institutions == ["国信证券", "山西证券"]
+    with pytest.raises(ValueError):
+        ReportComparisonRequest(stock_code="300750", comparison_mode="SELECTED", document_ids=list(range(1, 12)), limit=11)
+    with pytest.raises(ValueError):
+        ReportComparisonRequest(stock_code="300750", comparison_mode="CONSENSUS", document_ids=[1, 2])
+
+
+def test_forecast_ranges_deduplicate_older_reports_from_same_institution():
+    rows = [
+        {"institution": "甲证券", "forecasts": [{"year": 2027, "revenue": 600000, "net_profit": 90000, "eps": 20, "unit": "百万元；EPS为元"}]},
+        {"institution": "甲证券", "forecasts": [{"year": 2027, "revenue": 580000, "net_profit": 88000, "eps": 19, "unit": "百万元；EPS为元"}]},
+        {"institution": "乙证券", "forecasts": [{"year": 2027, "revenue": 650000, "net_profit": 95000, "eps": 22, "unit": "百万元；EPS为元"}]},
+    ]
+    result = _forecast_ranges(rows)
+    assert result[0]["institution_count"] == 2
+    assert result[0]["revenue"]["min"] == 6000
+    assert result[0]["revenue"]["max"] == 6500
