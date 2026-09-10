@@ -142,7 +142,24 @@ services:
   chat-worker:
     build:
       context: ./backend
-    command: celery -A app.worker.celery_app:celery worker --loglevel=INFO --queues=chat,reports --concurrency=1 --max-tasks-per-child=50 --hostname=chat@%h
+    command: celery -A app.worker.celery_app:celery worker --loglevel=INFO --queues=chat --concurrency=1 --max-tasks-per-child=50 --hostname=chat@%h
+    env_file: .env
+    volumes:
+      - ./backend:/app
+      - app_data:/app/data
+      - model_cache:/root/.cache/huggingface
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      milvus:
+        condition: service_healthy
+
+  ai-background-worker:
+    build:
+      context: ./backend
+    command: celery -A app.worker.celery_app:celery worker --loglevel=INFO --queues=reports,chat_memory --concurrency=1 --max-tasks-per-child=30 --hostname=ai-background@%h
     env_file: .env
     volumes:
       - ./backend:/app

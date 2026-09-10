@@ -25,15 +25,17 @@ celery.conf.update(
         "app.worker.tasks.sync_company_master": {"queue": "maintenance", "priority": 2},
         "app.worker.tasks.rebuild_vector_index": {"queue": "maintenance", "priority": 2},
         "app.worker.tasks.delete_from_vector_index": {"queue": "maintenance", "priority": 5},
+        "app.worker.tasks.update_conversation_memory": {"queue": "chat_memory", "priority": 4},
         "app.worker.tasks.recover_stale_tasks": {"queue": "maintenance", "priority": 8},
         "app.worker.tasks.sync_market_history": {"queue": "maintenance", "priority": 2},
         "app.worker.tasks.dispatch_market_sync": {"queue": "maintenance", "priority": 2},
     },
     task_annotations={
-        "app.worker.tasks.run_agent_message": {"soft_time_limit": 120, "time_limit": 150},
+        "app.worker.tasks.run_agent_message": {"soft_time_limit": 600, "time_limit": 630},
         "app.worker.tasks.generate_report": {"soft_time_limit": 240, "time_limit": 300},
         "app.worker.tasks.collect_company": {"soft_time_limit": 900, "time_limit": 960},
         "app.worker.tasks.process_document": {"soft_time_limit": 240, "time_limit": 300},
+        "app.worker.tasks.update_conversation_memory": {"soft_time_limit": 120, "time_limit": 150},
     },
     beat_schedule={
         "daily-reports-announcements": {"task": "app.worker.tasks.dispatch_tracked", "schedule": crontab(hour=8, minute=0), "args": [["RESEARCH_REPORT", "ANNOUNCEMENT"]]},

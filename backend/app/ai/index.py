@@ -30,7 +30,11 @@ def _local_model():
         return None
     try:
         from fastembed import TextEmbedding
-        return TextEmbedding(model_name=settings.embedding_model)
+        settings.embedding_cache_dir.mkdir(parents=True, exist_ok=True)
+        return TextEmbedding(
+            model_name=settings.embedding_model,
+            cache_dir=str(settings.embedding_cache_dir),
+        )
     except Exception:
         # The deterministic hash vector keeps offline classroom demos usable.
         return None

@@ -14,6 +14,7 @@ from sqlalchemy import delete, func, select
 from app.ai.extraction import extract_document, persist_extraction
 from app.ai.graph import run_message
 from app.ai.index import index_document, rebuild_index, remove_document_from_index
+from app.ai.conversation_memory import refresh_conversation_memory
 from app.collector.adapters import ADAPTERS
 from app.core.config import get_settings
 from app.core.database import SessionLocal
@@ -423,6 +424,16 @@ def delete_from_vector_index(document_id: int):
     return {"document_id": document_id, "deleted": True}
 
 
+@shared_task(name="app.worker.tasks.update_conversation_memory", ignore_result=True)
+def update_conversation_memory(message_id: int):
+    """Persist semantic memory away from the latency-sensitive chat queue."""
+    try:
+        return refresh_conversation_memory(message_id)
+    except Exception:
+        logger.exception("Conversation memory update failed for message %s", message_id)
+        return {"status": "failed", "message_id": message_id}
+
+
 @shared_task(name="app.worker.tasks.run_agent_message", ignore_result=True)
 def run_agent_message(message_id: int, execution_id: str | None = None):
     try:
@@ -432,12 +443,32 @@ def run_agent_message(message_id: int, execution_id: str | None = None):
                 return {"status": "cancelled", "message_id": message_id}
             if execution_id and message.task_id != execution_id:
                 return {"status": "superseded", "message_id": message_id}
+            metadata = dict(message.analysis_metadata or {})
+            metadata["queue_wait_ms"] = max(
+                0,
+                int((datetime.now() - message.created_at).total_seconds() * 1000),
+            )
+            metadata["worker_started_at"] = datetime.now().isoformat()
+            message.analysis_metadata = metadata
+            db.commit()
         result = run_message(message_id, execution_id)
         if result.get("status") in {"cancelled_or_superseded", "superseded"}:
             return {"status": result["status"], "message_id": message_id}
         with SessionLocal() as db:
             message = db.get(ChatMessage, message_id)
-            return {"status": str(message.status) if message else "missing", "message_id": message_id}
+            status = str(message.status) if message else "missing"
+            should_remember = bool(
+                message
+                and message.status in {
+                    MessageStatus.COMPLETED,
+                    MessageStatus.PARTIAL,
+                    MessageStatus.NEEDS_CLARIFICATION,
+                }
+                and message.answer
+            )
+        if should_remember:
+            update_conversation_memory.apply_async(args=[message_id], queue="chat_memory", priority=4)
+        return {"status": status, "message_id": message_id}
     except SoftTimeLimitExceeded:
         with SessionLocal() as db:
             message = db.get(ChatMessage, message_id)
@@ -445,7 +476,7 @@ def run_agent_message(message_id: int, execution_id: str | None = None):
                 message.status = MessageStatus.FAILED
                 message.progress = 100
                 message.status_text = "问答执行超时"
-                message.error = "问答任务超过2分钟，请重试。"
+                message.error = "问答任务超过系统总时限，请重试。"
                 db.commit()
         return {"status": "FAILED", "error": "soft_time_limit"}
     except Exception as exc:

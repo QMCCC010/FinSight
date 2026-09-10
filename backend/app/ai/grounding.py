@@ -91,7 +91,9 @@ def _citation_references(text: str) -> list[int]:
 
 def _number_tokens(text: str) -> list[str]:
     without_references = re.sub(r"\[\d+]", "", text)
-    return [token.replace(",", "") for token in re.findall(r"(?<![A-Za-z])\d[\d,]*(?:\.\d+)?%?", without_references)]
+    # Preserve the sign. Dropping it made a supported value such as ``-6.31%``
+    # compare against ``6.31%`` and falsely trigger UNSUPPORTED_NUMBER.
+    return [token.replace(",", "") for token in re.findall(r"(?<![A-Za-z0-9])[+-]?\d[\d,]*(?:\.\d+)?%?", without_references)]
 
 
 def contains_direct_trading_advice(text: str) -> bool:
@@ -171,9 +173,23 @@ def validate_grounded_answer(answer: str, citations: list[dict[str, Any]]) -> di
         else:
             supported_numeric_claims += 1
 
+    # Keep only structural citation fraud and direct trading instructions as
+    # hard blockers. Numeric/factual coverage is a quality warning: models may
+    # legitimately calculate or infer values from several cited observations.
+    hard_codes = {"INVALID_CITATION", "DIRECT_TRADING_ADVICE"}
+    hard_issues = [issue for issue in issues if issue["code"] in hard_codes]
+    soft_issues = [issue for issue in issues if issue["code"] not in hard_codes]
     return {
         "valid": not issues,
+        # ``valid`` remains the strict quality signal for diagnostics. Runtime
+        # routing uses ``hard_valid`` so an uncited analytical sentence is a
+        # warning rather than a reason to discard the whole model answer.
+        "hard_valid": not hard_issues,
         "issues": issues,
+        "hard_issues": hard_issues,
+        "soft_issues": soft_issues,
+        "hard_issue_count": len(hard_issues),
+        "soft_issue_count": len(soft_issues),
         "citation_count": len(citations),
         "referenced_citation_count": len(set(references) & valid_numbers),
         "numeric_claim_count": numeric_claims,
@@ -183,9 +199,16 @@ def validate_grounded_answer(answer: str, citations: list[dict[str, Any]]) -> di
     }
 
 
-def filter_unsupported_lines(answer: str, citations: list[dict[str, Any]]) -> tuple[str, dict[str, Any]]:
+def filter_unsupported_lines(
+    answer: str,
+    citations: list[dict[str, Any]],
+    *,
+    hard_only: bool = False,
+) -> tuple[str, dict[str, Any]]:
     """Keep safe LLM paragraphs and remove only unsupported material claims."""
-    blocking_codes = {"INVALID_CITATION", "UNCITED_NUMBER", "UNSUPPORTED_NUMBER", "UNCITED_FACT", "DIRECT_TRADING_ADVICE"}
+    blocking_codes = {"INVALID_CITATION", "DIRECT_TRADING_ADVICE"}
+    if not hard_only:
+        blocking_codes.update({"UNCITED_NUMBER", "UNSUPPORTED_NUMBER", "UNCITED_FACT"})
     kept: list[str] = []
     removed = 0
     for line in answer.splitlines():

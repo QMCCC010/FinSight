@@ -234,12 +234,32 @@ class ChatSession(Base, TimestampMixin):
     title: Mapped[str] = mapped_column(String(255), default="新对话")
 
 
+class ConversationSummary(Base, TimestampMixin):
+    __tablename__ = "conversation_summaries"
+    __table_args__ = (UniqueConstraint("user_id", "session_id", name="uq_conversation_summary_session"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    session_id: Mapped[int] = mapped_column(ForeignKey("chat_sessions.id"), unique=True, index=True)
+    summary: Mapped[str] = mapped_column(LONG_TEXT, default="")
+    active_entities: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    discussed_topics: Mapped[list[str]] = mapped_column(JSON, default=list)
+    user_preferences: Mapped[list[str]] = mapped_column(JSON, default=list)
+    pending_questions: Mapped[list[str]] = mapped_column(JSON, default=list)
+    covered_until_message_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    token_count: Mapped[int] = mapped_column(Integer, default=0)
+    summary_version: Mapped[int] = mapped_column(Integer, default=1)
+
+
 class ChatMessage(Base, TimestampMixin):
     __tablename__ = "chat_messages"
+    __table_args__ = (
+        UniqueConstraint("user_id", "session_id", "client_request_id", name="uq_chat_message_client_request"),
+    )
     id: Mapped[int] = mapped_column(primary_key=True)
     session_id: Mapped[int] = mapped_column(ForeignKey("chat_sessions.id"), index=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     role: Mapped[str] = mapped_column(String(16))
+    client_request_id: Mapped[str | None] = mapped_column(String(64), index=True)
     question: Mapped[str | None] = mapped_column(LONG_TEXT)
     answer: Mapped[str | None] = mapped_column(LONG_TEXT)
     status: Mapped[str] = mapped_column(String(32), default="QUEUED", index=True)

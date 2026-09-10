@@ -1,10 +1,11 @@
 import asyncio
 import json
 import logging
-from datetime import datetime, timedelta
+import re
+from datetime import datetime
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -125,24 +126,20 @@ async def message_events(
     db.close()
 
     async def stream():
-        signature = None
+        # Compare the complete client payload instead of relying on MySQL's
+        # second-precision updated_at. Fast direct answers can be created and
+        # completed within the same second, leaving count/id/timestamp
+        # unchanged and causing the browser to miss the completion event.
+        last_payload: str | None = None
         heartbeat = 0
         while not await request.is_disconnected():
             with SessionLocal() as stream_db:
-                current = stream_db.execute(
-                    select(func.count(ChatMessage.id), func.max(ChatMessage.id), func.max(ChatMessage.updated_at)).where(
-                        ChatMessage.session_id == session_id,
-                        ChatMessage.user_id == user_id,
-                    )
-                ).one()
-                if current != signature:
-                    rows = _recent_messages(stream_db, session_id, user_id)
-                    payload = [ChatMessageOut.model_validate(row).model_dump(mode="json") for row in rows]
-                else:
-                    payload = None
-            if payload is not None:
-                signature = current
-                yield f"event: messages\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                rows = _recent_messages(stream_db, session_id, user_id)
+                payload = [ChatMessageOut.model_validate(row).model_dump(mode="json") for row in rows]
+                encoded = json.dumps(payload, ensure_ascii=False)
+            if encoded != last_payload:
+                last_payload = encoded
+                yield f"event: messages\ndata: {encoded}\n\n"
             heartbeat += 1
             if heartbeat >= 15:
                 heartbeat = 0
@@ -160,12 +157,25 @@ async def message_events(
 def create_message(
     session_id: int,
     payload: CreateMessage,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> ChatMessage:
     session = db.scalar(select(ChatSession).where(ChatSession.id == session_id).with_for_update())
     if not session or session.user_id != user.id:
         raise HTTPException(status_code=404, detail="会话不存在")
+    if idempotency_key and (len(idempotency_key) > 64 or not re.fullmatch(r"[A-Za-z0-9._:-]{8,64}", idempotency_key)):
+        raise HTTPException(status_code=400, detail="Idempotency-Key格式无效")
+    if idempotency_key:
+        existing = db.scalar(select(ChatMessage).where(
+            ChatMessage.session_id == session_id,
+            ChatMessage.user_id == user.id,
+            ChatMessage.client_request_id == idempotency_key,
+        ))
+        if existing:
+            if existing.question != payload.question:
+                raise HTTPException(status_code=409, detail="同一个Idempotency-Key不能用于不同问题")
+            return existing
     db.scalar(select(User.id).where(User.id == user.id).with_for_update())
     active_count = db.scalar(select(func.count(ChatMessage.id)).where(
         ChatMessage.user_id == user.id,
@@ -173,17 +183,7 @@ def create_message(
     )) or 0
     if active_count >= MAX_ACTIVE_MESSAGES_PER_USER:
         raise HTTPException(status_code=429, detail="当前已有3个问答任务在运行，请等待完成或停止其中一个任务")
-    duplicate = db.scalar(
-        select(ChatMessage.id).where(
-            ChatMessage.session_id == session_id,
-            ChatMessage.user_id == user.id,
-            ChatMessage.question == payload.question,
-            ChatMessage.created_at >= datetime.now() - timedelta(seconds=5),
-        ).limit(1)
-    )
-    if duplicate:
-        raise HTTPException(status_code=409, detail="相同问题刚刚已经提交，请勿重复发送")
-    message = ChatMessage(session_id=session_id, user_id=user.id, role="assistant", question=payload.question, status=MessageStatus.QUEUED, status_text="问题已进入高优先级问答队列", clarification_candidates=[], analysis_metadata={})
+    message = ChatMessage(session_id=session_id, user_id=user.id, role="assistant", client_request_id=idempotency_key, question=payload.question, status=MessageStatus.QUEUED, status_text="问题已进入高优先级问答队列", clarification_candidates=[], analysis_metadata={})
     db.add(message)
     if session.title == "新对话":
         session.title = payload.question[:30]
@@ -263,8 +263,11 @@ def retry_message(message_id: int, db: Session = Depends(get_db), user: User = D
     message = db.scalar(select(ChatMessage).where(ChatMessage.id == message_id).with_for_update())
     if not message or message.user_id != user.id:
         raise HTTPException(status_code=404, detail="消息不存在")
-    if message.status not in {MessageStatus.FAILED, MessageStatus.CANCELLED}:
-        raise HTTPException(status_code=409, detail="只有失败或已停止的任务可以重新执行")
+    llm_degraded = bool((message.analysis_metadata or {}).get("llm_call", {}).get("degraded"))
+    if message.status not in {MessageStatus.FAILED, MessageStatus.CANCELLED} and not (
+        message.status in {MessageStatus.COMPLETED, MessageStatus.PARTIAL} and llm_degraded
+    ):
+        raise HTTPException(status_code=409, detail="只有失败、已停止或模型降级的任务可以重新执行")
     if message.task_id:
         from app.worker.celery_app import celery
         celery.control.revoke(message.task_id, terminate=False)
